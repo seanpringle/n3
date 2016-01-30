@@ -59,6 +59,8 @@ errortime ()
 //#define errorf(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while(0)
 #define errorf(...) do { errortime(); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while(0)
 
+typedef int (*callback)(void*);
+
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
@@ -131,50 +133,48 @@ typedef struct _self_t {
   int response;
 } self_t;
 
-#define F_SUM (1<<0)
-#define F_MAX (1<<1)
-#define F_MIN (1<<2)
-#define F_FIRST (1<<3)
-#define F_LAST (1<<4)
-#define F_MEAN (1<<5)
-#define F_MEDIAN (1<<6)
-#define F_DIFF (1<<7)
+struct _field_t;
+struct _field_key_t;
+struct _query_t;
 
-typedef struct _node_t {
-  number_t num;
-  struct _node_t *next;
-} node_t;
+typedef int (*field_cb)(struct _query_t*, struct _field_t*);
+typedef int (*field_process_cb)(struct _query_t*, struct _field_t*, struct _field_key_t*, record_t *record, pair_t *pair);
+
+typedef int (*query_callback)(struct _query_t*);
+
+typedef struct _field_key_t {
+  number_t key;
+  char alias[ALIAS];
+  struct _field_key_t *next;
+} field_key_t;
 
 typedef struct _field_t {
-  node_t *keys;
-  pair_t *col;
-  number_t flags;
-  number_t count_nodes;
-  number_t count_rows;
+  field_key_t *fkeys;
+  number_t val;
   number_t sum;
   number_t min;
   number_t max;
-  number_t diff1;
-  number_t diff2;
+  number_t diff;
+  field_cb prepare;
+  field_process_cb process;
+  field_cb cleanup;
   char alias[ALIAS];
+  int count;
   struct _field_t *next;
 } field_t;
 
-#define W_EQ (1<<0)
-#define W_LT (1<<1)
-#define W_GT (1<<2)
-#define W_NE (1<<3)
-#define W_AND (1<<4)
-#define W_OR (1<<5)
-#define W_XOR (1<<6)
-
-typedef struct {
-  number_t key;
-  number_t val;
-  number_t flags;
-} where_t;
-
-#define MAX_WHERES 32
+typedef struct _query_t {
+  int have_range;
+  int explicit_step;
+  field_t *fields;
+  number_t id;
+  number_t low;
+  number_t high;
+  number_t step;
+  int count;
+  int filled;
+  query_callback handler;
+} query_t;
 
 pthread_rwlock_t rwlock;
 pthread_mutex_t slab_mutex;
@@ -700,41 +700,6 @@ activityf(const char *pattern, ...)
   pthread_mutex_unlock(&activity_mutex);
 }
 
-void
-release_result (record_t *result)
-{
-  while (result)
-  {
-    while (result->pairs)
-    {
-      pair_t *npair = result->pairs->next;
-      release(result->pairs, sizeof(pair_t));
-      result->pairs = npair;
-    }
-
-    record_t *nresult = result->next;
-    release(result, sizeof(record_t));
-    result = nresult;
-  }
-}
-
-void
-release_fields (field_t *field)
-{
-  while (field)
-  {
-    while (field->keys)
-    {
-      node_t *next = field->keys->next;
-      release(field->keys, sizeof(node_t));
-      field->keys = next;
-    }
-    field_t *next = field->next;
-    release(field, sizeof(field_t));
-    field = next;
-  }
-}
-
 int
 parse_number (char **line, number_t *number, char *buffer)
 {
@@ -768,506 +733,6 @@ parse_number (char **line, number_t *number, char *buffer)
     }
   }
   return 0;
-}
-
-int
-fetch_range (record_t **results, number_t id, number_t range, number_t step, field_t *field, where_t *wheres, size_t where)
-{
-  record_t *first = NULL, *result = NULL, *record = NULL;
-
-  int rc = E_SERVER, keep = 0;
-
-  for (
-    number_t i = id;
-    i <= range && !record;
-    record = record_get(i), i++
-  );
-
-  number_t steps = 0;
-
-  for (; record && record->id <= range; record = record->link)
-  {
-    keep = (steps++ % step) == 0;
-
-    // if fields supplied, only retrieve records containing them
-    if (keep && field)
-    {
-      keep = 0;
-      for (pair_t *pair = record->pairs; !keep && pair; pair = pair->next)
-      {
-        for (field_t *f = field; !keep && f; f = f->next)
-        {
-          for (node_t *n = f->keys; !keep && n; n = n->next)
-            keep = (n->num == pair->key);
-        }
-      }
-    }
-
-    // if where clauses supplied, only retrieve records matching them
-    if (keep && where)
-    {
-      keep = 0;
-      for (pair_t *pair = record->pairs; pair; pair = pair->next)
-      {
-        int cmp = 0;
-        for (size_t i = 0; i < where; i++)
-        {
-          if (
-            (wheres[i].flags & W_EQ  && pair->key == wheres[i].key && pair->val == wheres[i].val) ||
-            (wheres[i].flags & W_NE  && pair->key == wheres[i].key && pair->val != wheres[i].val) ||
-            (wheres[i].flags & W_LT  && pair->key == wheres[i].key && pair->val <  wheres[i].val) ||
-            (wheres[i].flags & W_GT  && pair->key == wheres[i].key && pair->val >  wheres[i].val) ||
-            (wheres[i].flags & W_AND && pair->key == wheres[i].key && pair->val &  wheres[i].val) ||
-            (wheres[i].flags & W_OR  && pair->key == wheres[i].key && pair->val |  wheres[i].val) ||
-            (wheres[i].flags & W_XOR && pair->key == wheres[i].key && pair->val ^  wheres[i].val)
-          )
-            cmp++;
-        }
-        keep = cmp == where;
-      }
-    }
-
-    if (keep)
-    {
-      record_t *row = allocate(sizeof(record_t));
-      if (!row) goto fail;
-
-      row->id    = record->id;
-      row->pairs = NULL;
-      row->next  = NULL;
-      row->link  = NULL;
-
-      for (pair_t *pair = record->pairs; pair; pair = pair->next)
-      {
-        keep = 1;
-        if (field)
-        {
-          keep = 0;
-          for (field_t *f = field; !keep && f; f = f->next)
-          {
-            for (node_t *n = f->keys; !keep && n; n = n->next)
-              keep = (n->num == pair->key);
-          }
-        }
-        if (keep)
-        {
-          pair_t *col = allocate(sizeof(pair_t));
-          if (!col) goto fail;
-
-          col->key    = pair->key;
-          col->val    = pair->val;
-          col->next   = row->pairs;
-          row->pairs  = col;
-        }
-      }
-
-      if (row->pairs)
-      {
-        if (!first)
-          first = row;
-
-        row->link = result;
-        if (result)
-          result->next = row;
-        result = row;
-      }
-      else
-      {
-        release(row, sizeof(record_t));
-      }
-    }
-  }
-  *results = first;
-  return E_OK;
-
-fail:
-  release_result(result);
-  return rc;
-}
-
-int
-parse_range (char **src, record_t **results, char *errmsg, field_t **fields)
-{
-  pthread_rwlock_rdlock(&rwlock);
-
-  char *line = *src;
-  int fill_gaps = 0;
-
-  int rc = E_PARSE;
-  errmsg[0] = 0;
-
-  number_t id, range, step;
-
-  field_t *field = NULL;
-
-  where_t wheres[MAX_WHERES];
-  size_t where = 0;
-
-  record_t *result = NULL, *tmp = NULL;
-
-  // [key[ ... keyN]] [key=val[ ... keyN=val]] [start:stop[:step]]
-
-  while (*line)
-  {
-    line = strskip(line, isspace);
-
-    int is_field = regmatch(&re_field, line);
-    int is_field_aggr = !is_field && regmatch(&re_field_aggr, line);
-
-    if (is_field)
-    {
-      field_t *f = allocate(sizeof(field_t));
-
-      field_t **prev = &field;
-      while (*prev) prev = &(*prev)->next;
-      *prev = f; f->next = NULL;
-
-      f->keys = NULL;
-      f->flags = 0;
-      memset(f->alias, 0, ALIAS);
-
-      node_t *node = allocate(sizeof(node_t));
-      node->next = f->keys;
-      f->keys = node;
-
-      if (!parse_number(&line, &node->num, f->alias))
-        goto key_fail;
-
-      line = strskip(line, isspace);
-
-      if (regmatch(&re_field_as, line))
-      {
-        line += 3;
-
-        char *alias = f->alias;
-        int len = 0;
-
-        for (;
-          *line && isalias(*line) && len < ALIAS-1;
-          alias[len++] = *line++
-        );
-
-        alias[len] = 0;
-      }
-
-      continue;
-    }
-
-    if (is_field_aggr)
-    {
-      field_t *f = allocate(sizeof(field_t));
-
-      field_t **prev = &field;
-      while (*prev) prev = &(*prev)->next;
-      *prev = f; f->next = NULL;
-
-      f->keys = NULL;
-      f->flags = 0;
-      memset(f->alias, 0, ALIAS);
-
-      fill_gaps = 1;
-
-      if (!strncmp(line, "sum(", 4))
-      {
-        f->flags = F_SUM;
-        line += 4;
-      }
-      else
-      if (!strncmp(line, "diff(", 5))
-      {
-        f->flags = F_DIFF;
-        line += 5;
-      }
-      else
-      if (!strncmp(line, "max(", 4))
-      {
-        f->flags = F_MAX;
-        line += 4;
-      }
-      else
-      if (!strncmp(line, "min(", 4))
-      {
-        f->flags = F_MIN;
-        line += 4;
-      }
-      else
-      if (!strncmp(line, "first(", 6))
-      {
-        f->flags = F_FIRST;
-        line += 6;
-      }
-      else
-      if (!strncmp(line, "last(", 5))
-      {
-        f->flags = F_LAST;
-        line += 5;
-      }
-      else
-      if (!strncmp(line, "mean(", 5))
-      {
-        f->flags = F_MEAN;
-        line += 5;
-      }
-      else
-      if (!strncmp(line, "median(", 7))
-      {
-        f->flags = F_MEDIAN;
-        line += 7;
-      }
-
-      for (int i = 0; ; i++)
-      {
-        number_t num;
-
-        if (*line == ')' || !parse_number(&line, &num, f->alias))
-        {
-          if (i == 0)
-            goto key_fail;
-          break;
-        }
-
-        node_t *node = allocate(sizeof(node_t));
-
-        node_t **prev = &f->keys;
-        while (*prev) prev = &(*prev)->next;
-        *prev = node;
-        node->next = NULL;
-
-        node->num = num;
-
-        if (*line == ',') line++;
-      }
-
-      line++;
-      line = strskip(line, isspace);
-
-      if (regmatch(&re_field_as, line))
-      {
-        line += 3;
-
-        char *alias = f->alias;
-        int len = 0;
-
-        for (;
-          *line && isalias(*line) && len < ALIAS-1;
-          alias[len++] = *line++
-        );
-
-        alias[len] = 0;
-      }
-
-      continue;
-    }
-
-    if (regmatch(&re_where, line))
-    {
-      if (where == MAX_WHERES)
-      {
-        snprintf(errmsg, LINE, "exceeded %d filters", MAX_WHERES);
-        goto fail;
-      }
-
-      wheres[where].flags = 0;
-
-      if (!parse_number(&line, &wheres[where].key, NULL))
-        goto key_fail;
-
-      switch (*line++)
-      {
-        case '=': wheres[where].flags = W_EQ;
-        case '!': wheres[where].flags = W_NE;
-        case '<': wheres[where].flags = W_LT;
-        case '>': wheres[where].flags = W_GT;
-        case '&': wheres[where].flags = W_AND;
-        case '|': wheres[where].flags = W_OR;
-        case '^': wheres[where].flags = W_XOR;
-      }
-
-      if (!parse_number(&line, &wheres[where].val, NULL))
-        goto val_fail;
-
-      where++;
-      continue;
-    }
-
-    if (regmatch(&re_range, line))
-    {
-      if (!parse_number(&line, &id, NULL))
-        goto key_fail;
-
-      line++; // :
-
-      if (!parse_number(&line, &range, NULL))
-        goto key_fail;
-
-      step = 1;
-
-      if (*line == ':')
-      {
-        line++; // :
-
-        if (!parse_number(&line, &step, NULL))
-          goto num_fail;
-      }
-
-      rc = fetch_range(&result, id, range, fill_gaps ? 1: step, field, wheres, where);
-
-      if (rc != E_OK)
-        goto fail;
-
-      if (fill_gaps)
-      {
-        record_t *first = NULL, *consume = result;
-        tmp = result; result = NULL;
-
-        for (number_t i = id; i <= range; i += step)
-        {
-          record_t *row = allocate(sizeof(record_t));
-          if (!row) { rc = E_SERVER; goto fail; }
-
-          row->id    = i;
-          row->pairs = NULL;
-          row->next  = NULL;
-          row->link  = NULL;
-
-          int n = 0;
-          for (field_t *f = field; f; f = f->next, n++)
-          {
-            pair_t *col = allocate(sizeof(pair_t));
-            if (!col) { rc = E_SERVER; goto fail; }
-
-            pair_t **prev = &row->pairs;
-            while (*prev) prev = &(*prev)->next;
-            *prev = col;
-            col->next = NULL;
-
-            col->key = f->keys->num;
-            col->val = 0;
-
-            f->count_nodes = 0;
-            f->count_rows  = 0;
-
-            f->sum   = 0;
-            f->min   = 0;
-            f->max   = 0;
-            f->diff1 = 0;
-            f->diff2 = 0;
-            f->col   = col;
-          }
-
-          for (number_t j = i; j <= range && j < i+step; j++)
-          {
-            if (consume && consume->id == j)
-            {
-              for (field_t *f = field; f; f = f->next)
-              {
-                pair_t *col = f->col;
-                int touched = 0;
-
-                for (node_t *node = f->keys; node; node = node->next)
-                {
-                  for (pair_t *pair = consume->pairs; pair; pair = pair->next)
-                  {
-                    if (node->num == pair->key)
-                    {
-                      if (f->flags == F_LAST)
-                        col->val = pair->val;
-
-                      else if (f->count_nodes == 0) // implicit first()
-                        col->val = pair->val;
-
-                      f->sum  += pair->val;
-                      f->min   = f->count_nodes == 0 || pair->val < f->min ? pair->val: f->min;
-                      f->max   = f->max > pair->val ? f->max: pair->val;
-
-                      f->diff1 += f->keys == node ? pair->val: 0;
-                      f->diff2 += f->keys == node ? 0: pair->val;
-
-                      f->count_nodes++;
-                      touched = 1;
-                    }
-                  }
-                }
-                if (touched)
-                  f->count_rows++;
-              }
-              consume = consume->next;
-            }
-          }
-
-          for (field_t *f = field; f; f = f->next)
-          {
-            pair_t *col = f->col;
-
-            if (f->flags == F_MEAN)
-              col->val = f->count_nodes ? f->sum / f->count_nodes: 0;
-
-            else if (f->flags == F_MEDIAN)
-              col->val = f->max - ((f->max - f->min) /2);
-
-            else if (f->flags == F_MIN)
-              col->val = f->min;
-
-            else if (f->flags == F_MAX)
-              col->val = f->max;
-
-            else if (f->flags == F_SUM)
-              col->val = f->sum;
-
-            else if (f->flags == F_DIFF)
-            {
-              col->val = f->diff1 > f->diff2 ? (f->diff1 - f->diff2) : 0;
-              col->val = col->val / (f->count_rows ? f->count_rows: 1);
-            }
-          }
-
-          if (!first)
-            first = row;
-
-          row->link = result;
-          if (result)
-            result->next = row;
-          result = row;
-        }
-
-        release_result(tmp);
-        tmp = NULL;
-        *results = first;
-        goto done;
-      }
-
-      *results = result;
-      goto done;
-    }
-
-    snprintf(errmsg, LINE, "unknown syntax at: %s", line);
-    goto fail;
-  }
-
-done:
-  if (fields) *fields = field; else release_fields(field);
-  pthread_rwlock_unlock(&rwlock);
-  *src = line;
-  return E_OK;
-
-key_fail:
-  snprintf(errmsg, LINE, "expected key at: %s", line);
-  goto fail;
-
-val_fail:
-  snprintf(errmsg, LINE, "expected val at: %s", line);
-  goto fail;
-
-num_fail:
-  snprintf(errmsg, LINE, "expected num at: %s", line);
-  goto fail;
-
-fail:
-  pthread_rwlock_unlock(&rwlock);
-  release_result(tmp);
-  release_result(result);
-  release_fields(field);
-  return rc;
 }
 
 void
@@ -1390,56 +855,605 @@ done:
   pthread_rwlock_unlock(&rwlock);
 }
 
+int
+field_zero (query_t *query, field_t *field)
+{
+  field->val = 0;
+  field->sum = 0;
+  field->min = 0;
+  field->max = 0;
+  return E_OK;
+}
+
+int
+field_noop (query_t *query, field_t *field)
+{
+  return E_OK;
+}
+
+int
+field_process_noop (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  return E_OK;
+}
+
+int
+field_sum (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->sum += pair->val;
+  return E_OK;
+}
+
+int
+field_sum_cleanup (query_t *query, field_t *field)
+{
+  field->val = field->sum;
+  return E_OK;
+}
+
+int
+field_max (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->max = field->count == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
+  return E_OK;
+}
+
+int
+field_max_cleanup (query_t *query, field_t *field)
+{
+  field->val = field->max;
+  return E_OK;
+}
+
+int
+field_min (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->min = field->count == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
+  return E_OK;
+}
+
+int
+field_min_cleanup (query_t *query, field_t *field)
+{
+  field->val = field->min;
+  return E_OK;
+}
+
+int
+field_first (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  if (!field->count) field->val = pair->val;
+  return E_OK;
+}
+
+int
+field_last (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->val = pair->val;
+  return E_OK;
+}
+
+int
+field_mean (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->sum += pair->val;
+  return E_OK;
+}
+
+int
+field_mean_cleanup (query_t *query, field_t *field)
+{
+  field->val = field->sum / (field->count ? field->count: 1);
+  return E_OK;
+}
+
+int
+field_median (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  field->min = field->count == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
+  field->max = field->count == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
+  return E_OK;
+}
+
+int
+field_median_cleanup (query_t *query, field_t *field)
+{
+  field->val = field->max - ((field->max - field->min) / 2);
+  return E_OK;
+}
+
+int
+field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
+{
+  if (field->count == 0) field->sum  += pair->val;
+  if (field->count  > 0) field->diff += pair->val;
+  return E_OK;
+}
+
+int
+field_diff_cleanup (query_t *query, field_t *field)
+{
+  field->val = (field->sum - field->diff) / (query->count ? query->count: 1);
+  return E_OK;
+}
+
+int
+respond_row (query_t *query)
+{
+  respondf("%lu", query->id);
+
+  for (field_t *field = query->fields; field; field = field->next)
+  {
+    if (field->alias)
+    {
+      respondf("%s %lu", field->alias, field->val);
+      continue;
+    }
+    respondf(" %lu %lu", field->fkeys->key, field->val);
+  }
+
+  respondf("\n");
+  return E_OK;
+}
+
 void
 parse_select (char *line)
 {
-  record_t *result = NULL;
-  char errmsg[LINE];
+  pthread_rwlock_rdlock(&rwlock);
 
-  field_t *fields = NULL;
+  query_t select, *query =& select;
+  memset(query, 0, sizeof(query_t));
 
-  int rc = parse_range(&line, &result, errmsg, &fields);
+  query->handler = respond_row;
+  query->filled = 0;
 
-  if (rc == E_OK)
+  line = strskip(line, isspace);
+
+  // field list
+  while (line && *line)
   {
-    size_t results = 0;
-    for (record_t *row = result;
-      row;
-      results++, row = row->next
-    );
-
-    respondf("%u %lu\n", E_OK, results);
-
-    for (record_t *row = result; row; row = row->next)
+    if (isspace(*line))
     {
-      respondf("%lu", row->id);
-
-      int n = 0;
-      for (pair_t *col = row->pairs; col; col = col->next, n++)
-      {
-        int found = 0, fn = 0;
-        for (field_t *f = fields; !found && f; f = f->next, fn++)
-        {
-          if (n == fn && f->alias[0])
-          {
-            respondf(" %s %lu", f->alias, col->val);
-            found = 1;
-          }
-        }
-        if (!found)
-        {
-          respondf(" %lu %lu", col->key, col->val);
-        }
-      }
-      respondf("\n");
+      line = strskip(line, isspace);
+      continue;
     }
 
-    release_result(result);
-    release_fields(fields);
-    return;
+    if (!strncmp("from ", line, 5))
+    {
+      line += 5;
+      break;
+    }
+
+    // normal field, same as first()
+    if (regmatch(&re_field, line))
+    {
+      field_t *field = allocate(sizeof(field_t));
+      memset(field, 0, sizeof(field_t));
+
+      field->next = query->fields;
+      query->fields = field;
+
+      field->prepare = field_zero;
+      field->process = field_first;
+      field->cleanup = field_noop;
+
+      field_key_t *fk = allocate(sizeof(field_key_t));
+      memset(fk, 0, sizeof(field_key_t));
+
+      fk->next = field->fkeys;
+      field->fkeys = fk;
+
+      if (!parse_number(&line, &fk->key, fk->alias))
+        goto key_fail;
+
+      continue;
+    }
+
+    // max, min, sum, first, last, mean, median, diff
+    if (regmatch(&re_field_aggr, line))
+    {
+      field_t *field = allocate(sizeof(field_t));
+      memset(field, 0, sizeof(field_t));
+
+      field->next = query->fields;
+      query->fields = field;
+
+      field->prepare = field_zero;
+      field->process = field_process_noop;
+      field->cleanup = field_noop;
+
+      if (!strncmp("sum(", line, 4))
+      {
+        field->process = field_sum;
+        line += 4;
+      }
+      else
+      if (!strncmp("min(", line, 4))
+      {
+        field->process = field_min;
+        field->cleanup = field_min_cleanup;
+        line += 4;
+      }
+      else
+      if (!strncmp("max(", line, 4))
+      {
+        field->process = field_max;
+        field->cleanup = field_max_cleanup;
+        line += 4;
+      }
+      else
+      if (!strncmp("first(", line, 6))
+      {
+        field->process = field_first;
+        line += 6;
+      }
+      else
+      if (!strncmp("last(", line, 5))
+      {
+        field->process = field_last;
+        line += 5;
+      }
+      else
+      if (!strncmp("mean(", line, 5))
+      {
+        field->process = field_mean;
+        field->cleanup = field_mean_cleanup;
+        line += 5;
+      }
+      else
+      if (!strncmp("median(", line, 7))
+      {
+        field->process = field_median;
+        field->cleanup = field_median_cleanup;
+        line += 7;
+      }
+      else
+      if (!strncmp("diff(", line, 5))
+      {
+        field->process = field_diff;
+        field->cleanup = field_diff_cleanup;
+        line += 5;
+      }
+
+      while (isalias(*line))
+      {
+        field_key_t *fk = allocate(sizeof(field_key_t));
+        memset(fk, 0, sizeof(field_key_t));
+
+        fk->next = field->fkeys;
+        field->fkeys = fk;
+
+        if (!parse_number(&line, &fk->key, fk->alias))
+          goto key_fail;
+
+        if (*line == ',')
+          line++;
+      }
+
+      line++;
+      continue;
+    }
+
+    // as <name>
+    if (query->fields && regmatch(&re_field_as, line))
+    {
+      line += 3;
+      field_t *field = query->fields;
+      memset(field->alias, 0, ALIAS);
+
+      char *d = field->alias, *s = line;
+      for (;
+        *s && isalias(*s) && s - line < ALIAS-1;
+        *d++ = *s++
+      );
+      if (s - line == ALIAS-1 && isalias(*s))
+      {
+        respondf("%u alias max length %u at: %s\n", E_PARSE, ALIAS-1, line);
+        goto done;
+      }
+
+      line = s;
+      continue;
+    }
+
+    break;
   }
 
-  respondf("%u %s\n", rc, errmsg);
+  // from low:high[:step] [fill]
+  while (line && *line)
+  {
+    if (isspace(*line))
+    {
+      line = strskip(line, isspace);
+      continue;
+    }
+
+    if (regmatch(&re_range, line))
+    {
+      if (!parse_number(&line, &query->low, NULL))
+        goto id_fail;
+
+      line++;
+
+      if (!parse_number(&line, &query->high, NULL))
+        goto id_fail;
+
+      query->step = 1;
+
+      if (*line == ':')
+      {
+        line++;
+
+        if (!parse_number(&line, &query->step, NULL))
+          goto val_fail;
+
+        query->explicit_step = 1;
+      }
+
+      if (!strncmp(" fill", line, 5))
+      {
+        query->filled = 1;
+        line += 5;
+      }
+
+      query->have_range = 1;
+    }
+
+    break;
+  }
+
+  // where clauses
+  while (line && *line)
+  {
+    if (isspace(*line))
+    {
+      line = strskip(line, isspace);
+      continue;
+    }
+
+    if (!strncmp("where ", line, 6))
+    {
+      line += 6;
+      continue;
+    }
+
+    if (!strncmp("and ", line, 4))
+    {
+      line += 4;
+      continue;
+    }
+
+    // parse field
+    // operation
+    // arg list
+
+    break;
+  }
+
+  if (*line)
+  {
+    respondf("%u unknown syntax: %s\n", E_PARSE, line);
+    goto done;
+  }
+
+  if (!query->have_range)
+  {
+    respondf("%u missing id range\n", E_PARSE);
+    goto done;
+  }
+
+  if (query->low > query->high)
+  {
+    respondf("%u invalid range: %lu:%lu:%lu\n", E_PARSE, query->low, query->high, query->step);
+    goto done;
+  }
+
+  // Range query, no gaps, multi-row aggregation
+  if (query->filled)
+  {
+    respondf("%u %lu\n", E_OK, (query->high - query->low) / query->step + 1);
+
+    for (number_t id = query->low; id <= query->high; id += query->step)
+    {
+      query->count = 0;
+      query->id = id;
+      record_t *record = NULL;
+
+      for (
+        number_t i = id;
+        !record && i <= query->high && i < id + query->step;
+        record = record_get(i), i++
+      );
+
+      for (field_t *field = query->fields; field; field = field->next)
+      {
+        field->count = 0;
+        field->prepare(query, field);
+      }
+
+      for (; record && record->id <= query->high && record->id < id + query->step; record = record->link)
+      {
+        for (field_t *field = query->fields; field; field = field->next)
+        {
+          for (pair_t *pair = record->pairs; pair; pair = pair->next)
+          {
+            for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
+            {
+              if (pair->key == fk->key)
+              {
+                field->process(query, field, fk, record, pair);
+                field->count++;
+              }
+            }
+          }
+        }
+        query->count++;
+      }
+
+      for (field_t *field = query->fields; field; field = field->next)
+      {
+        field->cleanup(query, field);
+      }
+
+      query->handler(query);
+    }
+  }
+  else
+  // Range query, possible gaps, multi-row aggregation
+  if (query->explicit_step)
+  {
+    query->count = 0;
+
+    for (number_t id = query->low; id <= query->high; id += query->step)
+    {
+      record_t *record = NULL;
+
+      for (
+        number_t i = id;
+        !record && i <= query->high && i < id + query->step;
+        record = record_get(i), i++
+      );
+
+      if (!record)
+        continue;
+
+      query->count++;
+    }
+
+    respondf("%u %lu\n", E_OK, query->count);
+
+    for (number_t id = query->low; id <= query->high; id += query->step)
+    {
+      query->count = 0;
+      query->id = id;
+      record_t *record = NULL;
+
+      for (
+        number_t i = id;
+        !record && i <= query->high && i < id + query->step;
+        record = record_get(i), i++
+      );
+
+      if (!record)
+        continue;
+
+      for (field_t *field = query->fields; field; field = field->next)
+      {
+        field->count = 0;
+        field->prepare(query, field);
+      }
+
+      for (; record && record->id <= query->high && record->id < id + query->step; record = record->link)
+      {
+        for (field_t *field = query->fields; field; field = field->next)
+        {
+          for (pair_t *pair = record->pairs; pair; pair = pair->next)
+          {
+            for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
+            {
+              if (pair->key == fk->key)
+              {
+                field->process(query, field, fk, record, pair);
+                field->count++;
+              }
+            }
+          }
+        }
+        query->count++;
+      }
+
+      for (field_t *field = query->fields; field; field = field->next)
+      {
+        field->cleanup(query, field);
+      }
+
+      query->handler(query);
+    }
+  }
+  else
+  // Simple range query, no multi-row aggregation
+  {
+    query->count = 0;
+    record_t *record = NULL;
+
+    for (
+      number_t i = query->low;
+      !record && i <= query->high;
+      record = record_get(i), i++
+    );
+
+    for (record_t *r = record; r && r->id <= query->high; r = r->link)
+    {
+      query->count++;
+    }
+
+    respondf("%u %lu\n", E_OK, query->count);
+    query->count = 0;
+
+    for (; record && record->id <= query->high; record = record->link)
+    {
+      query->count = 0;
+      query->id = record->id;
+
+      for (field_t *field = query->fields; field; field = field->next)
+      {
+        field->count = 0;
+        field->prepare(query, field);
+
+        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        {
+          for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
+          {
+            if (pair->key == fk->key)
+            {
+              field->process(query, field, fk, record, pair);
+              field->count++;
+            }
+          }
+        }
+        field->cleanup(query, field);
+      }
+      query->handler(query);
+    }
+  }
+
+  goto done;
+
+id_fail:
+  respondf("%u expected id at: %s\n", E_PARSE, line);
+  goto done;
+
+key_fail:
+  respondf("%u expected key at: %s\n", E_PARSE, line);
+  goto done;
+
+val_fail:
+  respondf("%u expected val at: %s\n", E_PARSE, line);
+  goto done;
+
+done:
+
+  while (query->fields)
+  {
+    field_t *field = query->fields;
+    field_t *next  = field->next;
+
+    while (field->fkeys)
+    {
+      field_key_t *fk = field->fkeys;
+      field_key_t *fknext = fk->next;
+
+      release(fk, sizeof(field_key_t));
+
+      field->fkeys = fknext;
+    }
+
+    release(field, sizeof(field_t));
+
+    query->fields = next;
+  }
+
+  pthread_rwlock_unlock(&rwlock);
 }
 
 void
@@ -1518,7 +1532,6 @@ parse_match (char *line)
 done:
   pthread_rwlock_unlock(&rwlock);
 }
-
 
 void
 status ()
@@ -1903,7 +1916,7 @@ main (int argc, char *argv[])
   }
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
-  
+
   ensure((activity = fopen(scratch, "a+")) && activity)
     errorf("missing %s", scratch);
 
