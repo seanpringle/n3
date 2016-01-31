@@ -69,6 +69,7 @@ typedef int (*callback)(void*);
 #define E_PARSE 1
 #define E_SERVER 2
 #define E_MISSING 3
+#define E_MEMORY 4
 
 #define O_INSERT 1
 #define O_DELETE 2
@@ -978,6 +979,38 @@ field_diff_cleanup (query_t *query, field_t *field)
 }
 
 int
+field_create (query_t *query)
+{
+  field_t *field = allocate(sizeof(field_t));
+  if (!field) return E_MEMORY;
+
+  memset(field, 0, sizeof(field_t));
+
+  field->next = query->fields;
+  query->fields = field;
+
+  field->prepare = field_zero;
+  field->process = field_first;
+  field->cleanup = field_noop;
+
+  return E_OK;
+}
+
+int
+field_key_create (field_t *field)
+{
+  field_key_t *fk = allocate(sizeof(field_key_t));
+  if (!fk) return E_MEMORY;
+
+  memset(fk, 0, sizeof(field_key_t));
+
+  fk->next = field->fkeys;
+  field->fkeys = fk;
+
+  return E_OK;
+}
+
+int
 respond_row (query_t *query)
 {
   respondf("%lu", query->id);
@@ -1027,15 +1060,10 @@ parse_select (char *line)
     // normal field, same as first()
     if (regmatch(&re_field, line))
     {
-      field_t *field = allocate(sizeof(field_t));
-      memset(field, 0, sizeof(field_t));
+      if (field_create(query) != E_OK)
+        goto res_fail;
 
-      field->next = query->fields;
-      query->fields = field;
-
-      field->prepare = field_zero;
-      field->process = field_first;
-      field->cleanup = field_noop;
+      field_t *field = query->fields;
 
       field_key_t *fk = allocate(sizeof(field_key_t));
       memset(fk, 0, sizeof(field_key_t));
@@ -1052,15 +1080,10 @@ parse_select (char *line)
     // max, min, sum, first, last, mean, median, diff
     if (regmatch(&re_field_aggr, line))
     {
-      field_t *field = allocate(sizeof(field_t));
-      memset(field, 0, sizeof(field_t));
+      if (field_create(query) != E_OK)
+        goto res_fail;
 
-      field->next = query->fields;
-      query->fields = field;
-
-      field->prepare = field_zero;
-      field->process = field_process_noop;
-      field->cleanup = field_noop;
+      field_t *field = query->fields;
 
       if (!strncmp("sum(", line, 4))
       {
@@ -1117,11 +1140,10 @@ parse_select (char *line)
 
       while (isalias(*line))
       {
-        field_key_t *fk = allocate(sizeof(field_key_t));
-        memset(fk, 0, sizeof(field_key_t));
+        if (field_key_create(field) != E_OK)
+          goto res_fail;
 
-        fk->next = field->fkeys;
-        field->fkeys = fk;
+        field_key_t *fk = field->fkeys;
 
         if (!parse_number(&line, &fk->key, fk->alias))
           goto key_fail;
@@ -1417,6 +1439,10 @@ parse_select (char *line)
     }
   }
 
+  goto done;
+
+res_fail:
+  respondf("%u insufficient resources\n", E_SERVER, line);
   goto done;
 
 id_fail:
