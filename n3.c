@@ -1091,7 +1091,7 @@ parse_select (char *line)
       if (!field) goto res_fail;
 
       field_key_t *fk = field_key_create(field);
-      if (!field) goto res_fail;
+      if (!fk) goto res_fail;
 
       if (!parse_number(&line, &fk->key, fk->alias))
         goto key_fail;
@@ -1161,10 +1161,8 @@ parse_select (char *line)
 
       while (isalias(*line))
       {
-        if (field_key_create(field) != E_OK)
-          goto res_fail;
-
-        field_key_t *fk = field->fkeys;
+        field_key_t *fk = field_key_create(field);
+        if (!fk) goto res_fail;
 
         if (!parse_number(&line, &fk->key, fk->alias))
           goto key_fail;
