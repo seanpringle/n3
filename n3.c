@@ -174,6 +174,7 @@ typedef struct _query_t {
   number_t step;
   int count;
   int filled;
+  int touched;
   query_callback handler;
 } query_t;
 
@@ -1296,6 +1297,8 @@ parse_select (char *line)
 
       for (; record && record->id <= query->high && record->id < id + query->step; record = record->link)
       {
+        query->touched = 0;
+
         for (field_t *field = query->fields; field; field = field->next)
         {
           for (pair_t *pair = record->pairs; pair; pair = pair->next)
@@ -1306,11 +1309,15 @@ parse_select (char *line)
               {
                 field->process(query, field, fk, record, pair);
                 field->count++;
+                query->touched++;
               }
             }
           }
         }
-        query->count++;
+        if (query->touched)
+        {
+          query->count++;
+        }
       }
 
       for (field_t *field = query->fields; field; field = field->next)
