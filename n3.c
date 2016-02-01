@@ -990,7 +990,7 @@ field_diff_cleanup (query_t *query, field_t *field)
   int n = field->count ? field->count: 1;
   number_t s = field->sum / n;
   number_t d = field->diff / n;
-  field->val = s - d;
+  field->val = s > d ? s - d: 0;
   return E_OK;
 }
 
@@ -1302,7 +1302,6 @@ parse_select (char *line)
 
       for (field_t *field = query->fields; field; field = field->next)
       {
-        field->count = 0;
         field->prepare(query, field);
       }
 
@@ -1310,9 +1309,9 @@ parse_select (char *line)
       {
         for (field_t *field = query->fields; field; field = field->next)
         {
-          for (pair_t *pair = record->pairs; pair; pair = pair->next)
+          for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
-            for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
+            for (pair_t *pair = record->pairs; pair; pair = pair->next)
             {
               if (pair->key == fk->key)
               {
@@ -1372,7 +1371,6 @@ parse_select (char *line)
 
       for (field_t *field = query->fields; field; field = field->next)
       {
-        field->count = 0;
         field->prepare(query, field);
       }
 
