@@ -863,6 +863,7 @@ field_zero (query_t *query, field_t *field)
   field->sum = 0;
   field->min = 0;
   field->max = 0;
+  field->diff = 0;
   return E_OK;
 }
 
@@ -974,7 +975,7 @@ field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, p
 int
 field_diff_cleanup (query_t *query, field_t *field)
 {
-  field->val = (field->sum - field->diff) / (query->count ? query->count: 1);
+  field->val = field->sum > field->diff ? ((field->sum - field->diff) / (query->count ? query->count: 1)): 0;
   return E_OK;
 }
 
