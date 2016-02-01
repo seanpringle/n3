@@ -975,7 +975,10 @@ field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, p
 int
 field_diff_cleanup (query_t *query, field_t *field)
 {
-  field->val = field->sum > field->diff ? ((field->sum - field->diff) / (query->count ? query->count: 1)): 0;
+  int n = query->count ? query->count: 1;
+  number_t s = field->sum / n;
+  number_t d = field->diff / n;
+  field->val = s - d;
   return E_OK;
 }
 
