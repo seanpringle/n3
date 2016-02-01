@@ -174,7 +174,6 @@ typedef struct _query_t {
   number_t step;
   int count;
   int filled;
-  int touched;
   query_callback handler;
 } query_t;
 
@@ -865,6 +864,7 @@ field_zero (query_t *query, field_t *field)
   field->min = 0;
   field->max = 0;
   field->diff = 0;
+  field->count = 0;
   return E_OK;
 }
 
@@ -884,6 +884,7 @@ int
 field_sum (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   field->sum += pair->val;
+  field->count++;
   return E_OK;
 }
 
@@ -897,7 +898,7 @@ field_sum_cleanup (query_t *query, field_t *field)
 int
 field_max (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
-  field->max = field->count == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
+  field->max = field->count++ == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
   return E_OK;
 }
 
@@ -911,7 +912,7 @@ field_max_cleanup (query_t *query, field_t *field)
 int
 field_min (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
-  field->min = field->count == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
+  field->min = field->count++ == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
   return E_OK;
 }
 
@@ -925,7 +926,7 @@ field_min_cleanup (query_t *query, field_t *field)
 int
 field_first (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
-  if (!field->count) field->val = pair->val;
+  if (!field->count++) field->val = pair->val;
   return E_OK;
 }
 
@@ -933,6 +934,7 @@ int
 field_last (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   field->val = pair->val;
+  field->count++;
   return E_OK;
 }
 
@@ -940,6 +942,7 @@ int
 field_mean (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   field->sum += pair->val;
+  field->count++;
   return E_OK;
 }
 
@@ -955,6 +958,7 @@ field_median (query_t *query, field_t *field, field_key_t *fk, record_t *record,
 {
   field->min = field->count == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
   field->max = field->count == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
+  field->count++;
   return E_OK;
 }
 
@@ -968,15 +972,22 @@ field_median_cleanup (query_t *query, field_t *field)
 int
 field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
-  if (field->fkeys == fk) field->sum  += pair->val;
-  if (field->fkeys != fk) field->diff += pair->val;
+  if (field->fkeys == fk)
+  {
+    field->sum += pair->val;
+    field->count++;
+  }
+  if (field->fkeys != fk)
+  {
+    field->diff += pair->val;
+  }
   return E_OK;
 }
 
 int
 field_diff_cleanup (query_t *query, field_t *field)
 {
-  int n = query->count ? query->count: 1;
+  int n = field->count ? field->count: 1;
   number_t s = field->sum / n;
   number_t d = field->diff / n;
   field->val = s - d;
@@ -1297,8 +1308,6 @@ parse_select (char *line)
 
       for (; record && record->id <= query->high && record->id < id + query->step; record = record->link)
       {
-        query->touched = 0;
-
         for (field_t *field = query->fields; field; field = field->next)
         {
           for (pair_t *pair = record->pairs; pair; pair = pair->next)
@@ -1308,15 +1317,9 @@ parse_select (char *line)
               if (pair->key == fk->key)
               {
                 field->process(query, field, fk, record, pair);
-                field->count++;
-                query->touched++;
               }
             }
           }
-        }
-        if (query->touched)
-        {
-          query->count++;
         }
       }
 
@@ -1384,12 +1387,10 @@ parse_select (char *line)
               if (pair->key == fk->key)
               {
                 field->process(query, field, fk, record, pair);
-                field->count++;
               }
             }
           }
         }
-        query->count++;
       }
 
       for (field_t *field = query->fields; field; field = field->next)
@@ -1427,7 +1428,6 @@ parse_select (char *line)
 
       for (field_t *field = query->fields; field; field = field->next)
       {
-        field->count = 0;
         field->prepare(query, field);
 
         for (pair_t *pair = record->pairs; pair; pair = pair->next)
@@ -1437,7 +1437,6 @@ parse_select (char *line)
             if (pair->key == fk->key)
             {
               field->process(query, field, fk, record, pair);
-              field->count++;
             }
           }
         }
