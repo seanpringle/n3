@@ -986,8 +986,9 @@ field_create (query_t *query)
 
   memset(field, 0, sizeof(field_t));
 
-  field->next = query->fields;
-  query->fields = field;
+  field_t **prev = &query->fields;
+  while (*prev) prev = &((*prev)->next);
+  *prev = field;
 
   field->prepare = field_zero;
   field->process = field_first;
