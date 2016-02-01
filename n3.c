@@ -978,11 +978,11 @@ field_diff_cleanup (query_t *query, field_t *field)
   return E_OK;
 }
 
-int
+field_t*
 field_create (query_t *query)
 {
   field_t *field = allocate(sizeof(field_t));
-  if (!field) return E_MEMORY;
+  if (!field) return NULL;
 
   memset(field, 0, sizeof(field_t));
 
@@ -994,14 +994,14 @@ field_create (query_t *query)
   field->process = field_first;
   field->cleanup = field_noop;
 
-  return E_OK;
+  return field;
 }
 
-int
+field_key_t*
 field_key_create (field_t *field)
 {
   field_key_t *fk = allocate(sizeof(field_key_t));
-  if (!fk) return E_MEMORY;
+  if (!fk) return NULL;
 
   memset(fk, 0, sizeof(field_key_t));
 
@@ -1009,7 +1009,7 @@ field_key_create (field_t *field)
   while (*prev) prev = &((*prev)->next);
   *prev = fk;
 
-  return E_OK;
+  return fk;
 }
 
 int
@@ -1063,7 +1063,10 @@ parse_select (char *line)
     if (query->fields && regmatch(&re_field_as, line))
     {
       line += 3;
+
       field_t *field = query->fields;
+      while (field && field->next) field = field->next;
+
       memset(field->alias, 0, ALIAS);
 
       char *d = field->alias, *s = line;
@@ -1084,16 +1087,11 @@ parse_select (char *line)
     // normal field, same as first()
     if (regmatch(&re_field, line))
     {
-      if (field_create(query) != E_OK)
-        goto res_fail;
+      field_t *field = field_create(query);
+      if (!field) goto res_fail;
 
-      field_t *field = query->fields;
-
-      field_key_t *fk = allocate(sizeof(field_key_t));
-      memset(fk, 0, sizeof(field_key_t));
-
-      fk->next = field->fkeys;
-      field->fkeys = fk;
+      field_key_t *fk = field_key_create(field);
+      if (!field) goto res_fail;
 
       if (!parse_number(&line, &fk->key, fk->alias))
         goto key_fail;
@@ -1104,10 +1102,8 @@ parse_select (char *line)
     // max, min, sum, first, last, mean, median, diff
     if (regmatch(&re_field_aggr, line))
     {
-      if (field_create(query) != E_OK)
-        goto res_fail;
-
-      field_t *field = query->fields;
+      field_t *field = field_create(query);
+      if (!field) goto res_fail;
 
       if (!strncmp("sum(", line, 4))
       {
