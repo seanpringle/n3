@@ -1110,6 +1110,7 @@ parse_select (char *line)
       if (!strncmp("sum(", line, 4))
       {
         field->process = field_sum;
+        field->cleanup = field_sum_cleanup;
         line += 4;
       }
       else
