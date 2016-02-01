@@ -1057,6 +1057,28 @@ parse_select (char *line)
       break;
     }
 
+    // as <name>
+    if (query->fields && regmatch(&re_field_as, line))
+    {
+      line += 3;
+      field_t *field = query->fields;
+      memset(field->alias, 0, ALIAS);
+
+      char *d = field->alias, *s = line;
+      for (;
+        *s && isalias(*s) && s - line < ALIAS-1;
+        *d++ = *s++
+      );
+      if (s - line == ALIAS-1 && isalias(*s))
+      {
+        respondf("%u alias max length %u at: %s\n", E_PARSE, ALIAS-1, line);
+        goto done;
+      }
+
+      line = s;
+      continue;
+    }
+
     // normal field, same as first()
     if (regmatch(&re_field, line))
     {
@@ -1153,28 +1175,6 @@ parse_select (char *line)
       }
 
       line++;
-      continue;
-    }
-
-    // as <name>
-    if (query->fields && regmatch(&re_field_as, line))
-    {
-      line += 3;
-      field_t *field = query->fields;
-      memset(field->alias, 0, ALIAS);
-
-      char *d = field->alias, *s = line;
-      for (;
-        *s && isalias(*s) && s - line < ALIAS-1;
-        *d++ = *s++
-      );
-      if (s - line == ALIAS-1 && isalias(*s))
-      {
-        respondf("%u alias max length %u at: %s\n", E_PARSE, ALIAS-1, line);
-        goto done;
-      }
-
-      line = s;
       continue;
     }
 
