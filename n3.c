@@ -1020,7 +1020,7 @@ respond_row (query_t *query)
 
   for (field_t *field = query->fields; field; field = field->next)
   {
-    if (field->alias)
+    if (field->alias[0])
     {
       respondf(" %s %lu", field->alias, field->val);
       continue;
