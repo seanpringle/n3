@@ -966,8 +966,8 @@ field_median_cleanup (query_t *query, field_t *field)
 int
 field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
-  if (field->count == 0) field->sum  += pair->val;
-  if (field->count  > 0) field->diff += pair->val;
+  if (field->fkeys == fk) field->sum  += pair->val;
+  if (field->fkeys != fk) field->diff += pair->val;
   return E_OK;
 }
 
