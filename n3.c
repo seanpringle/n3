@@ -1005,8 +1005,9 @@ field_key_create (field_t *field)
 
   memset(fk, 0, sizeof(field_key_t));
 
-  fk->next = field->fkeys;
-  field->fkeys = fk;
+  field_key_t **prev = &field->fkeys;
+  while (*prev) prev = &((*prev)->next);
+  *prev = fk;
 
   return E_OK;
 }
