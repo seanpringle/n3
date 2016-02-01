@@ -1019,7 +1019,7 @@ respond_row (query_t *query)
   {
     if (field->alias)
     {
-      respondf("%s %lu", field->alias, field->val);
+      respondf(" %s %lu", field->alias, field->val);
       continue;
     }
     respondf(" %lu %lu", field->fkeys->key, field->val);
