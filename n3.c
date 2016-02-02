@@ -650,6 +650,25 @@ record_delete(number_t id)
   return 0;
 }
 
+record_t*
+record_get_within (number_t id, number_t limit)
+{
+  record_t *record = NULL;
+
+  if (!store.least || store.least->id > limit)
+    return NULL;
+
+  if (store.least->id >= id && store.least->id <= limit)
+    return store.least;
+
+  for (
+    number_t i = id;
+    !record && i <= limit;
+    record = record_get(i), i++
+  );
+  return record;
+}
+
 int
 trywrite (int fd, void *buffer, size_t length)
 {
@@ -790,70 +809,27 @@ parse_insert (char *line)
 }
 
 void
-parse_delete (char *line)
+fields_release (query_t *query)
 {
-  pthread_rwlock_wrlock(&rwlock);
-  int deleted = 0;
-
-  for (;;)
+  while (query->fields)
   {
-    line = strskip(line, isspace);
-    if (!*line) break;
+    field_t *field = query->fields;
+    field_t *next  = field->next;
 
-    if (regmatch(&re_range, line))
+    while (field->fkeys)
     {
-      number_t low, high;
+      field_key_t *fk = field->fkeys;
+      field_key_t *fknext = fk->next;
 
-      if (!parse_number(&line, &low, NULL))
-      {
-        respondf("%u expected id at: %s\n", E_PARSE, line);
-        goto done;
-      }
+      release(fk, sizeof(field_key_t));
 
-      line++;
-
-      if (!parse_number(&line, &high, NULL))
-      {
-        respondf("%u expected id at: %s\n", E_PARSE, line);
-        goto done;
-      }
-
-      record_t *record = record_get(low);
-
-      if (!record)
-      {
-        record = store.least;
-        while (record && record->id < low)
-          record = record->next;
-      }
-
-      while (record && record->id >= low && record->id <= high)
-      {
-        record_t *next = record->next;
-
-        for (pair_t *pair = record->pairs; pair; pair = pair->next)
-          pair_delete(record, pair->key);
-
-        record_delete(record->id);
-        deleted++;
-
-        record = next;
-      }
-
-      if (deleted)
-        activityf("2 %lu:%lu", low, high);
-
-      continue;
+      field->fkeys = fknext;
     }
 
-    respondf("%u unknown syntax at: %s\n", E_PARSE, line);
-    goto done;
+    release(field, sizeof(field_t));
+
+    query->fields = next;
   }
-
-  respondf("%u %lu\n", E_OK, deleted);
-
-done:
-  pthread_rwlock_unlock(&rwlock);
 }
 
 int
@@ -1292,13 +1268,10 @@ parse_select (char *line)
     {
       query->count = 0;
       query->id = id;
-      record_t *record = NULL;
 
-      for (
-        number_t i = id;
-        !record && i <= query->high && i < id + query->step;
-        record = record_get(i), i++
-      );
+      number_t step_limit = id + query->step - 1;
+      number_t find_limit = query->high < step_limit ? query->high: step_limit;
+      record_t *record = record_get_within(id, find_limit);
 
       for (field_t *field = query->fields; field; field = field->next)
       {
@@ -1338,13 +1311,9 @@ parse_select (char *line)
 
     for (number_t id = query->low; id <= query->high; id += query->step)
     {
-      record_t *record = NULL;
-
-      for (
-        number_t i = id;
-        !record && i <= query->high && i < id + query->step;
-        record = record_get(i), i++
-      );
+      number_t step_limit = id + query->step - 1;
+      number_t find_limit = query->high < step_limit ? query->high: step_limit;
+      record_t *record = record_get_within(id, find_limit);
 
       if (!record)
         continue;
@@ -1358,13 +1327,10 @@ parse_select (char *line)
     {
       query->count = 0;
       query->id = id;
-      record_t *record = NULL;
 
-      for (
-        number_t i = id;
-        !record && i <= query->high && i < id + query->step;
-        record = record_get(i), i++
-      );
+      number_t step_limit = id + query->step - 1;
+      number_t find_limit = query->high < step_limit ? query->high: step_limit;
+      record_t *record = record_get_within(id, find_limit);
 
       if (!record)
         continue;
@@ -1403,13 +1369,7 @@ parse_select (char *line)
   // Simple range query, no multi-row aggregation
   {
     query->count = 0;
-    record_t *record = NULL;
-
-    for (
-      number_t i = query->low;
-      !record && i <= query->high;
-      record = record_get(i), i++
-    );
+    record_t *record = record_get_within(query->low, query->high);
 
     for (record_t *r = record; r && r->id <= query->high; r = r->link)
     {
@@ -1463,27 +1423,139 @@ val_fail:
   goto done;
 
 done:
+  fields_release(query);
+  pthread_rwlock_unlock(&rwlock);
+}
 
-  while (query->fields)
+void
+parse_delete (char *line)
+{
+  pthread_rwlock_wrlock(&rwlock);
+  int deleted_records = 0;
+  int deleted_pairs = 0;
+  int field_count = 0;
+
+  query_t delete, *query = &delete;
+  memset(&delete, 0, sizeof(query_t));
+
+  while (line && *line)
   {
-    field_t *field = query->fields;
-    field_t *next  = field->next;
-
-    while (field->fkeys)
+    if (isspace(*line))
     {
-      field_key_t *fk = field->fkeys;
-      field_key_t *fknext = fk->next;
-
-      release(fk, sizeof(field_key_t));
-
-      field->fkeys = fknext;
+      line = strskip(line, isspace);
+      continue;
     }
 
-    release(field, sizeof(field_t));
+    if (!strncmp("from ", line, 5))
+    {
+      line += 5;
+      break;
+    }
 
-    query->fields = next;
+    if (regmatch(&re_field, line))
+    {
+      field_t *field = field_create(query);
+      if (!field) goto res_fail;
+
+      field_key_t *fk = field_key_create(field);
+      if (!fk) goto res_fail;
+
+      if (!parse_number(&line, &fk->key, fk->alias))
+        goto key_fail;
+
+      field_count++;
+    }
+
+    break;
   }
 
+  while (line && *line)
+  {
+    if (isspace(*line))
+    {
+      line = strskip(line, isspace);
+      continue;
+    }
+
+    if (regmatch(&re_range, line))
+    {
+      if (!parse_number(&line, &query->low, NULL))
+        goto id_fail;
+
+      line++;
+
+      if (!parse_number(&line, &query->high, NULL))
+        goto id_fail;
+
+      if (*line && !isspace(*line))
+        goto syn_fail;
+
+      record_t *record = record_get_within(query->low, query->high);
+
+      while (record && record->id >= query->low && record->id <= query->high)
+      {
+        record_t *next = record->link;
+
+        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        {
+          int kill = 1;
+          if (query->fields)
+          {
+            kill = 0;
+            for (field_t *field = query->fields; !kill && field; field = field->next)
+              kill = (field->fkeys->key == pair->key);
+          }
+          if (kill)
+          {
+            pair_delete(record, pair->key);
+            deleted_pairs++;
+          }
+        }
+        if (!record->pairs)
+        {
+          record_delete(record->id);
+          deleted_records++;
+        }
+        record = next;
+      }
+
+      if (deleted_records || deleted_pairs)
+      {
+        int limit = field_count * 25 + 255, length = 0;
+        char scratch[limit]; scratch[0] = 0;
+
+        for (field_t *field = query->fields; field; field = field->next)
+          length += sprintf(scratch + length, " %lu", field->fkeys->key);
+
+        activityf("2%s %lu:%lu", scratch, query->low, query->high);
+      }
+      break;
+    }
+
+    goto id_fail;
+  }
+
+  respondf("%u %lu %lu\n", E_OK, deleted_records, deleted_pairs);
+  goto done;
+
+syn_fail:
+  respondf("%u unexpected syntax\n", E_PARSE, line);
+  goto done;
+
+res_fail:
+  respondf("%u insufficient resources\n", E_SERVER, line);
+  goto done;
+
+id_fail:
+  respondf("%u expected id at: %s\n", E_PARSE, line);
+  goto done;
+
+key_fail:
+  respondf("%u expected key at: %s\n", E_PARSE, line);
+  goto done;
+
+done:
+  fields_release(query);
   pthread_rwlock_unlock(&rwlock);
 }
 
