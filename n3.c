@@ -291,7 +291,6 @@ slab_allocate (slab_t **slab)
     new->next = *slab;
     *slab = new;
   }
-
 done:
   pthread_mutex_unlock(&slab_mutex);
   return ptr;
@@ -301,7 +300,6 @@ int
 slab_release (slab_t **slab, void *ptr)
 {
   pthread_mutex_lock(&slab_mutex);
-
   int rc = 0;
 
   for (slab_t *s = *slab; s; s = s->next)
@@ -315,7 +313,6 @@ slab_release (slab_t **slab, void *ptr)
       goto done;
     }
   }
-
 done:
   pthread_mutex_unlock(&slab_mutex);
   return rc;
@@ -345,9 +342,7 @@ allocate (size_t bytes)
   }
 
   state.mem_used += bytes;
-
   pthread_mutex_unlock(&state_mutex);
-
   return malloc(bytes);
 }
 
@@ -356,13 +351,11 @@ release (void *ptr, size_t bytes)
 {
   if (ptr)
   {
-
     if (state.slab && bytes == sizeof(record_t))
     {
       slab_release(&slab_record, ptr);
       return;
     }
-
     if (state.slab && bytes == sizeof(pair_t))
     {
       slab_release(&slab_pair, ptr);
@@ -375,9 +368,7 @@ release (void *ptr, size_t bytes)
       errorf("bad state.mem_used");
 
     state.mem_used -= bytes;
-
     pthread_mutex_unlock(&state_mutex);
-
     free(ptr);
   }
 }
@@ -722,6 +713,17 @@ activityf(const char *pattern, ...)
 }
 
 int
+magic_get (char *name, number_t *num)
+{
+  if (!strcmp(name, "now"))
+  {
+    *num = (number_t)time(NULL);
+    return 1;
+  }
+  return 0;
+}
+
+int
 parse_number (char **line, number_t *number, char *buffer)
 {
   char *cursor = strskip(*line, isspace);
@@ -747,7 +749,7 @@ parse_number (char **line, number_t *number, char *buffer)
       buffer[i] = *cursor++, i++
     );
 
-    if (alias_get(buffer, number))
+    if (alias_get(buffer, number) || magic_get(buffer, number))
     {
       *line = cursor;
       return 1;
