@@ -174,6 +174,7 @@ typedef struct _query_t {
   number_t step;
   int count;
   int filled;
+  int all_fields;
   query_callback handler;
 } query_t;
 
@@ -1045,6 +1046,13 @@ parse_select (char *line)
       continue;
     }
 
+    if (!strncmp("* ", line, 2))
+    {
+      query->all_fields = 1;
+      line += 2;
+      continue;
+    }
+
     if (!strncmp("from ", line, 5))
     {
       line += 5;
@@ -1383,6 +1391,22 @@ parse_select (char *line)
     {
       query->count = 0;
       query->id = record->id;
+
+      if (query->all_fields)
+      {
+        fields_release(query);
+
+        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        {
+          field_t *field  = field_create(query);
+          if (!field) goto res_fail;
+
+          field_key_t *fk = field_key_create(field);
+          if (!fk) goto res_fail;
+
+          fk->key = pair->key;
+        }
+      }
 
       for (field_t *field = query->fields; field; field = field->next)
       {
@@ -1899,13 +1923,31 @@ main (int argc, char *argv[])
   char scratch[PATH];
 
   store.width = 9973;
-  dict.width = 997;
-  state.mem_limit = 1024 * 1024 * 256;
-  state.max_packet = 1024 * 1024 * 1;
+  dict.width  = 997;
+
+  state.mem_limit   = 1024 * 1024 * 1024;
+  state.max_packet  = 1024 * 1024 * 1;
   state.max_threads = 16;
+
   state.slab = 0;
   state.slab_width_record = 100000;
   state.slab_width_pair   = 10000000;
+
+  long page_size  = sysconf(_SC_PAGESIZE);
+  long phys_pages = sysconf(_SC_PHYS_PAGES);
+
+  if (page_size > 0 && phys_pages > 0)
+  {
+    number_t total_mem = (number_t)phys_pages * (number_t)page_size;
+
+    if (total_mem > 1024 * 1024 * 1024)
+    {
+      store.width = 99991;
+      dict.width  = 9973;
+    }
+
+    state.mem_limit = total_mem * 0.75;
+  }
 
   snprintf(state.sock_path, sizeof(state.sock_path), "/tmp/n3.sock");
   snprintf(state.data_path, sizeof(state.data_path), ".");
