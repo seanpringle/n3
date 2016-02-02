@@ -161,6 +161,7 @@ typedef struct _field_t {
   field_cb cleanup;
   char alias[ALIAS];
   int count;
+  int null;
   struct _field_t *next;
 } field_t;
 
@@ -838,6 +839,7 @@ fields_release (query_t *query)
 int
 field_zero (query_t *query, field_t *field)
 {
+  field->null = 1;
   field->val = 0;
   field->sum = 0;
   field->min = 0;
@@ -864,6 +866,7 @@ field_sum (query_t *query, field_t *field, field_key_t *fk, record_t *record, pa
 {
   field->sum += pair->val;
   field->count++;
+  field->null = 0;
   return E_OK;
 }
 
@@ -878,6 +881,7 @@ int
 field_max (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   field->max = field->count++ == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
+  field->null = 0;
   return E_OK;
 }
 
@@ -892,6 +896,7 @@ int
 field_min (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   field->min = field->count++ == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
+  field->null = 0;
   return E_OK;
 }
 
@@ -906,6 +911,7 @@ int
 field_first (query_t *query, field_t *field, field_key_t *fk, record_t *record, pair_t *pair)
 {
   if (!field->count++) field->val = pair->val;
+  field->null = 0;
   return E_OK;
 }
 
@@ -914,6 +920,7 @@ field_last (query_t *query, field_t *field, field_key_t *fk, record_t *record, p
 {
   field->val = pair->val;
   field->count++;
+  field->null = 0;
   return E_OK;
 }
 
@@ -922,6 +929,7 @@ field_mean (query_t *query, field_t *field, field_key_t *fk, record_t *record, p
 {
   field->sum += pair->val;
   field->count++;
+  field->null = 0;
   return E_OK;
 }
 
@@ -938,6 +946,7 @@ field_median (query_t *query, field_t *field, field_key_t *fk, record_t *record,
   field->min = field->count == 0 ? pair->val: (field->max < pair->val ? field->max: pair->val);
   field->max = field->count == 0 ? pair->val: (field->max > pair->val ? field->max: pair->val);
   field->count++;
+  field->null = 0;
   return E_OK;
 }
 
@@ -960,6 +969,7 @@ field_diff (query_t *query, field_t *field, field_key_t *fk, record_t *record, p
   {
     field->diff += pair->val;
   }
+  field->null = 0;
   return E_OK;
 }
 
@@ -1014,12 +1024,18 @@ respond_row (query_t *query)
 
   for (field_t *field = query->fields; field; field = field->next)
   {
+    char val[25];
+    sprintf(val, "%lu", field->val);
+
+    if (field->null)
+      sprintf(val, "null");
+
     if (field->alias[0])
     {
-      respondf(" %s %lu", field->alias, field->val);
+      respondf(" %s %s", field->alias, val);
       continue;
     }
-    respondf(" %lu %lu", field->fkeys->key, field->val);
+    respondf(" %lu %s", field->fkeys->key, val);
   }
 
   respondf("\n");
