@@ -7,9 +7,9 @@ A nested map of unsigned 64-bit integers.
     map <uint64_t, map <uint64_t, uint64_t>>
 
 * No restriction on what each number means:
-    * IDs might be UNIX timestamps, keys might be metrics, values might be scaled fixed-point measurements
-    * IDs might be object identifiers, keys might be references to other objects, values might be weights
-    * IDs might be RDBMS surrogate keys, keys might be table fields, values ... etc
+    * IDs might be UNIX timestamps / keys might be metrics / values might be scaled fixed-point measurements
+    * IDs might be object identifiers / keys might be references to other objects / values might be weights
+    * IDs might be RDBMS surrogate keys / keys might be table fields / values ... etc
 * Numbers can have text aliases for query readbility
 * IDs are sorted in ascending order
 
@@ -74,3 +74,4 @@ A nested map of unsigned 64-bit integers.
 * last
 * sum
 * diff
+
