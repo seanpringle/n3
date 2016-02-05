@@ -44,7 +44,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <time.h>
 #include <pthread.h>
 
-#define ensure(x) for ( ; !(x) ; exit(EXIT_FAILURE) )
+void
+abort ()
+{
+  raise(SIGABRT);
+  exit(EXIT_FAILURE);
+}
+
+#define ensure(x) for ( ; !(x) ; abort() )
 
 void
 errortime ()
@@ -64,6 +71,9 @@ typedef int (*callback)(void*);
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
+#define POOL 1000000
+#define POOL_CHAINS 9973
+#define POOL_CHAIN_LIMIT 10
 
 #define E_OK 0
 #define E_PARSE 1
@@ -79,15 +89,31 @@ typedef int (*delimiter)(int);
 typedef uint64_t number_t;
 typedef uint64_t counter_t;
 
+typedef struct _pool_node_t {
+  void *ptr;
+  off_t offset;
+  struct _pool_node_t *next;
+} pool_node_t;
+
+typedef struct _pool_t {
+  size_t size;
+  size_t width;
+  off_t first;
+  FILE *head;
+  FILE *data;
+  pool_node_t *chains[POOL_CHAINS];
+} pool_t;
+
 typedef struct _pair_t {
+  off_t offset;
+  off_t sibling;
   number_t key;
   number_t val;
-  struct _pair_t *next;
 } pair_t;
 
 typedef struct _record_t {
   number_t id;
-  pair_t *pairs;
+  off_t pairs;
   struct _record_t *next, *link;
 } record_t;
 
@@ -116,19 +142,8 @@ typedef struct {
   char sock_path[LINE];
   char data_path[LINE];
   size_t max_packet;
-  int slab;
-  size_t slab_width_record;
-  size_t slab_width_pair;
   size_t max_threads;
 } state_t;
-
-typedef struct _slab_t {
-  size_t size;
-  size_t width;
-  int first;
-  void *region;
-  struct _slab_t *next;
-} slab_t;
 
 typedef struct _self_t {
   int response;
@@ -180,7 +195,6 @@ typedef struct _query_t {
 } query_t;
 
 pthread_rwlock_t rwlock;
-pthread_mutex_t slab_mutex;
 pthread_mutex_t state_mutex;
 pthread_mutex_t alias_mutex;
 pthread_mutex_t activity_mutex;
@@ -192,8 +206,7 @@ store_t store;
 state_t state;
 dict_t dict;
 
-slab_t *slab_record;
-slab_t *slab_pair;
+pool_t pool_pair;
 
 #define RE_NAME "[[:alpha:]][[:digit:][:alpha:]_.@-]*"
 
@@ -222,115 +235,9 @@ regex_t re_alias_set;
 regex_t re_alias_get;
 #define RE_ALIAS_GET "^" RE_NAME
 
-slab_t*
-slab_create (size_t size, size_t width)
-{
-  size_t bytes = sizeof(slab_t) + (size * width);
-  slab_t *slab = NULL;
-
-  pthread_mutex_lock(&state_mutex);
-
-  if (state.mem_used + bytes >= state.mem_limit)
-  {
-    if (!state.mem_limit_hit)
-      errorf("hit state.mem_limit %lu", state.mem_limit);
-    state.mem_limit_hit++;
-    goto done;
-  }
-
-  slab = malloc(sizeof(slab_t));
-  if (!slab) goto done;
-
-  slab->region = malloc(size * width);
-  if (!slab->region) { free(slab); slab = NULL; goto done; }
-
-  slab->size  = size;
-  slab->width = width;
-
-  state.mem_used += bytes;
-
-  for (size_t i = 0; i < width-1; i++)
-    *((int*)(slab->region + (i * size))) = i+1;
-  *((int*)(slab->region + ((width-1) * size))) = -1;
-  slab->first = 0;
-
-  errorf("slab: %d %d", (int)size, (int)width);
-
-done:
-  pthread_mutex_unlock(&state_mutex);
-  return slab;
-}
-
-void*
-slab_allocate (slab_t **slab)
-{
-  pthread_mutex_lock(&slab_mutex);
-
-  void *ptr = NULL;
-
-  for (;;)
-  {
-    for (slab_t *s = *slab; s; s = s->next)
-    {
-      if (s->first >= 0)
-      {
-        ptr = s->region + (s->first * s->size);
-        s->first = *((int*)ptr);
-        memset(ptr, 0, s->size);
-        goto done;
-      }
-    }
-
-    slab_t *new = slab_create((*slab)->size, (*slab)->width);
-
-    if (!new)
-    {
-      ptr = NULL;
-      goto done;
-    }
-
-    new->next = *slab;
-    *slab = new;
-  }
-done:
-  pthread_mutex_unlock(&slab_mutex);
-  return ptr;
-}
-
-int
-slab_release (slab_t **slab, void *ptr)
-{
-  pthread_mutex_lock(&slab_mutex);
-  int rc = 0;
-
-  for (slab_t *s = *slab; s; s = s->next)
-  {
-    if (ptr >= s->region && ptr <= s->region + s->size * s->width)
-    {
-      int slot = (ptr - s->region) / s->size;
-      *((int*)(s->region + slot * s->size)) = s->first;
-      s->first = slot;
-      rc = 1;
-      goto done;
-    }
-  }
-done:
-  pthread_mutex_unlock(&slab_mutex);
-  return rc;
-}
-
 void*
 allocate (size_t bytes)
 {
-  if (state.slab)
-  {
-    if (bytes == sizeof(record_t))
-      return slab_allocate(&slab_record);
-
-    if (bytes == sizeof(pair_t))
-      return slab_allocate(&slab_pair);
-  }
-
   pthread_mutex_lock(&state_mutex);
 
   if (state.mem_used + bytes >= state.mem_limit)
@@ -352,17 +259,6 @@ release (void *ptr, size_t bytes)
 {
   if (ptr)
   {
-    if (state.slab && bytes == sizeof(record_t))
-    {
-      slab_release(&slab_record, ptr);
-      return;
-    }
-    if (state.slab && bytes == sizeof(pair_t))
-    {
-      slab_release(&slab_pair, ptr);
-      return;
-    }
-
     pthread_mutex_lock(&state_mutex);
 
     ensure(state.mem_used >= bytes)
@@ -372,6 +268,266 @@ release (void *ptr, size_t bytes)
     pthread_mutex_unlock(&state_mutex);
     free(ptr);
   }
+}
+
+void
+pool_flush (pool_t *pool)
+{
+  pool_t tmp;
+  memmove(&tmp, pool, sizeof(pool_t));
+
+  tmp.head  = NULL;
+  tmp.data  = NULL;
+
+  ensure(fseeko(pool->head, 0, SEEK_SET) == 0)
+    errorf("cannot seek %06lu.head", pool->size);
+
+  ensure(fwrite(&tmp, sizeof(pool_t), 1, pool->head) == 1)
+    errorf("cannot write %06lu.head", pool->size);
+}
+
+void
+pool_extend (pool_t *pool)
+{
+  errorf("extending pool: %06lu", pool->size);
+
+  int bytes = pool->size * POOL;
+  unsigned char *chunk = allocate(bytes);
+  memset(chunk, 0, bytes);
+
+  unsigned char *p = chunk;
+
+  for (int i = 0; i < POOL; i++)
+  {
+    *((off_t*)p) = pool->width + i + 1;
+    p += pool->size;
+  }
+
+  p -= pool->size;
+  *((off_t*)p) = 0;
+
+  pool->first = pool->width;
+
+  ensure(fseeko(pool->data, pool->width * pool->size, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data", pool->size);
+
+  ensure(fwrite(chunk, 1, bytes, pool->data) == bytes)
+    errorf("cannot extend pool: %06lu", pool->size);
+
+  pool->width += POOL;
+  release(chunk, bytes);
+}
+
+void
+pool_init (size_t size)
+{
+  char scratch[100];
+
+  pool_t _pool, *pool = &_pool;
+  pool->size  = size;
+  pool->width = 0;
+  pool->first = 0;
+  pool->head  = NULL;
+  pool->data  = NULL;
+
+  errorf("initializing pool: %06lu", pool->size);
+
+  snprintf(scratch, sizeof(scratch), "%06lu.head", pool->size);
+
+  ensure((pool->head = fopen(scratch, "w")))
+    errorf("cannot create pool: %06lu.head", pool->size);
+
+  snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
+
+  ensure((pool->data = fopen(scratch, "w")))
+    errorf("cannot create pool: %06lu.data", pool->size);
+
+  pool_extend(pool);
+  pool->first++;
+
+  pool_flush(pool);
+
+  fclose(pool->head);
+  fclose(pool->data);
+}
+
+int
+pool_open (pool_t *pool, size_t size)
+{
+  char scratch[100];
+
+  memset(pool, 0, sizeof(pool_t));
+  pool->size = size;
+
+  snprintf(scratch, sizeof(scratch), "%06lu.head", pool->size);
+
+  if (!(pool->head = fopen(scratch, "r+")))
+  {
+    errorf("cannot open pool: %06lu.head", pool->size);
+    return 0;
+  }
+
+  snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
+
+  if (!(pool->data = fopen(scratch, "r+")))
+  {
+    errorf("cannot open pool: %06lu.data", pool->size);
+    return 0;
+  }
+
+  pool_t tmp;
+
+  ensure(fread(&tmp, 1, sizeof(pool_t), pool->head) == sizeof(pool_t))
+    errorf("cannot read pool: %06lu.head", pool->size);
+
+  pool->width = tmp.width;
+  pool->first = tmp.first;
+
+  for (int i = 0; i < POOL_CHAINS; i++)
+    pool->chains[i] = NULL;
+
+  return 1;
+}
+
+void*
+pool_bubble (pool_t *pool, off_t item)
+{
+  int chain = item % POOL_CHAINS;
+  pool_node_t **prev = &pool->chains[chain];
+
+  while (*prev && (*prev)->offset != item)
+    prev = &((*prev)->next);
+
+  if (*prev)
+  {
+    pool_node_t *node = *prev;
+    *prev = node->next;
+    node->next = pool->chains[chain];
+    pool->chains[chain] = node;
+    return node;
+  }
+
+  return NULL;
+}
+
+void
+pool_track (pool_t *pool, off_t item, void *ptr)
+{
+  int chain = item % POOL_CHAINS;
+  pool_node_t *node = pool->chains[chain];
+
+  int length = 0;
+  pool_node_t *a = NULL, *b = NULL;
+
+  while (node && node->offset != item)
+  {
+    a = b; b = node;
+    node = node->next;
+    length++;
+  }
+
+  if (!node)
+  {
+    node = allocate(sizeof(pool_node_t));
+    node->ptr = allocate(pool->size);
+    node->offset = item;
+    node->next = pool->chains[chain];
+    pool->chains[chain] = node;
+  }
+
+  memmove(node->ptr, ptr, pool->size);
+
+  if (a && b && length > POOL_CHAIN_LIMIT)
+  {
+    a->next = b->next;
+    release(b->ptr, pool->size);
+    release(b, sizeof(pool_node_t));
+  }
+}
+
+void
+pool_read (pool_t *pool, off_t item, void *ptr)
+{
+  ensure(item < pool->width)
+    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+
+  pool_node_t *node = pool_bubble(pool, item);
+
+  if (node)
+  {
+    memmove(ptr, node->ptr, pool->size);
+    return;
+  }
+
+  ensure(item > 0)
+    errorf("attempt to access item 0 in pool: %06lu", pool->size);
+
+  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data", pool->size);
+
+  ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
+    errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
+
+  pool_track(pool, item, ptr);
+}
+
+void
+pool_write (pool_t *pool, off_t item, void *ptr)
+{
+  ensure(item < pool->width)
+    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+
+  ensure(item > 0)
+    errorf("attempt to access item 0 in pool: %06lu", pool->size);
+
+  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data", pool->size);
+
+  ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
+    errorf("cannot write pool: %06lu.head", pool->size);
+
+  pool_track(pool, item, ptr);
+}
+
+off_t
+pool_alloc (pool_t *pool)
+{
+  if (!pool->first)
+    pool_extend(pool);
+
+  void *ptr = malloc(pool->size);
+  off_t item = pool->first;
+
+  pool_read(pool, item, ptr);
+
+  pool->first = *((off_t*)ptr);
+  pool_flush(pool);
+
+  memset(ptr, 0, pool->size);
+  pool_write(pool, item, ptr);
+
+  free(ptr);
+  return item;
+}
+
+void
+pool_free (pool_t *pool, off_t item)
+{
+  ensure(item < pool->width)
+    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+
+  void *ptr = malloc(pool->size);
+
+  pool_read(pool, item, ptr);
+  memset(ptr, 0, pool->size);
+
+  *((off_t*)ptr) = pool->first;
+  pool->first = item;
+
+  pool_flush(pool);
+  pool_write(pool, item, ptr);
+
+  free(ptr);
 }
 
 int
@@ -510,59 +666,77 @@ alias_get (char *str, number_t *num)
   return rc;
 }
 
+pair_t*
+pair_first (record_t *record, pair_t *pair)
+{
+  if (record->pairs)
+  {
+    pool_read(&pool_pair, record->pairs, pair);
+    return pair;
+  }
+  return NULL;
+}
+
+pair_t*
+pair_next (pair_t *pair)
+{
+  if (pair && pair->sibling)
+  {
+    pool_read(&pool_pair, pair->sibling, pair);
+    return pair;
+  }
+  return NULL;
+}
+
 int
 pair_insert (record_t *record, number_t key, number_t val)
 {
-  pair_t *pair = NULL;
-
-  pair = record->pairs;
+  pair_t _pair, *pair = pair_first(record, &_pair);
 
   while (pair && pair->key != key)
-    pair = pair->next;
+    pair = pair_next(pair);
 
   if (pair && pair->val == val)
-  {
     return 2;
-  }
 
   if (pair)
   {
     pair->val = val;
+    pool_write(&pool_pair, pair->offset, pair);
     return 1;
   }
 
-  pair = allocate(sizeof(pair_t));
+  pair = &_pair;
+  pair->key = key;
+  pair->val = val;
+  pair->offset = pool_alloc(&pool_pair);
 
-  if (pair)
-  {
-    pair->key = key;
-    pair->val = val;
+  pair->sibling = record->pairs;
+  record->pairs = pair->offset;
 
-    pair->next = record->pairs;
-    record->pairs = pair;
+  pool_write(&pool_pair, pair->offset, pair);
 
-    return 1;
-  }
-
-  return 0;
+  return 1;
 }
 
 int
 pair_delete (record_t *record, number_t key)
 {
-  pair_t **prev = &record->pairs;
+  pair_t pair1, pair2, *pair = pair_first(record, &pair1);
+  memset(&pair2, 0, sizeof(pair_t));
 
-  while (*prev && (*prev)->key != key)
-    prev = &(*prev)->next;
-
-  if (*prev)
+  while (pair && pair->key != key)
   {
-    pair_t *pair = *prev;
-    *prev = pair->next;
-    release(pair, sizeof(pair_t));
+    memmove(&pair2, &pair1, sizeof(pair_t));
+    pair = pair_next(pair);
+  }
+  if (pair)
+  {
+    pair2.sibling = pair->sibling;
+    pool_write(&pool_pair, pair2.offset, &pair2);
+    pool_free(&pool_pair, pair->offset);
     return 1;
   }
-
   return 0;
 }
 
@@ -584,7 +758,7 @@ record_set (number_t id)
   if (record)
   {
     record->id    = id;
-    record->pairs = NULL;
+    record->pairs = 0;
     record->next  = store.chains[id % store.width];
     record->link  = NULL;
     store.chains[id % store.width] = record;
@@ -1310,7 +1484,8 @@ parse_select (char *line)
         {
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
-            for (pair_t *pair = record->pairs; pair; pair = pair->next)
+            pair_t _pair;
+            for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
             {
               if (pair->key == fk->key)
               {
@@ -1370,7 +1545,8 @@ parse_select (char *line)
       {
         for (field_t *field = query->fields; field; field = field->next)
         {
-          for (pair_t *pair = record->pairs; pair; pair = pair->next)
+          pair_t _pair;
+          for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
           {
             for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
             {
@@ -1414,7 +1590,8 @@ parse_select (char *line)
       {
         fields_release(query);
 
-        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        pair_t _pair;
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
         {
           field_t *field  = field_create(query);
           if (!field) goto res_fail;
@@ -1430,7 +1607,8 @@ parse_select (char *line)
       {
         field->prepare(query, field);
 
-        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        pair_t _pair;
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
         {
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
@@ -1538,7 +1716,8 @@ parse_delete (char *line)
       {
         record_t *next = record->link;
 
-        for (pair_t *pair = record->pairs; pair; pair = pair->next)
+        pair_t _pair;
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
         {
           int kill = 1;
           if (query->fields)
@@ -1691,10 +1870,11 @@ status ()
     record = record->link, records++
   )
   {
+    pair_t _pair;
     for (
-      pair_t *pair = record->pairs;
+      pair_t *pair = pair_first(record, &_pair);
       pair;
-      pair = pair->next, pairs++
+      pair = pair_next(pair), pairs++
     );
   }
 
@@ -1716,9 +1896,6 @@ status ()
   respondf(" max_packet %u", (uint32_t)state.max_packet);
   respondf(" path %s", state.data_path);
   respondf(" socket %s", state.sock_path);
-  respondf(" slab %d", state.slab);
-  respondf(" slab_width_record %u", (uint32_t)state.slab_width_record);
-  respondf(" slab_width_pair %u", (uint32_t)state.slab_width_pair);
 
   number_t chains_avg, chains_min, chains_max;
 
@@ -1794,7 +1971,8 @@ consolidate ()
     if (record->pairs)
     {
       fprintf(activity, "1 %lu", record->id);
-      for (pair_t *pair = record->pairs; pair; pair = pair->next)
+      pair_t _pair;
+      for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
         fprintf(activity, " %lu %lu", pair->key, pair->val);
       fprintf(activity, "\n");
     }
@@ -1947,10 +2125,6 @@ main (int argc, char *argv[])
   state.max_packet  = 1024 * 1024 * 1;
   state.max_threads = 16;
 
-  state.slab = 0;
-  state.slab_width_record = 100000;
-  state.slab_width_pair   = 10000000;
-
   long page_size  = sysconf(_SC_PAGESIZE);
   long phys_pages = sysconf(_SC_PHYS_PAGES);
 
@@ -1971,7 +2145,6 @@ main (int argc, char *argv[])
   snprintf(state.data_path, sizeof(state.data_path), ".");
 
   pthread_rwlock_init(&rwlock, NULL);
-  pthread_mutex_init(&slab_mutex, NULL);
   pthread_mutex_init(&state_mutex, NULL);
   pthread_mutex_init(&alias_mutex, NULL);
   pthread_mutex_init(&activity_mutex, NULL);
@@ -1981,23 +2154,15 @@ main (int argc, char *argv[])
   pthread_setspecific(keyself, &_self);
   signal(SIGPIPE, SIG_IGN);
 
+//  if (!pool_open(&pool_pair, sizeof(pair_t)))
+//  {
+    pool_init(sizeof(pair_t));
+    ensure(pool_open(&pool_pair, sizeof(pair_t)))
+      errorf("unable to open pair_t pool");
+//  }
+
   for (int i = 1; i < argc; i++)
   {
-    if (!strcmp("-slab", argv[i]))
-    {
-      state.slab = 1;
-      continue;
-    }
-    if (!strcmp("-slabrecord", argv[i]))
-    {
-      state.slab_width_record = strtoll(argv[++i], NULL, 0);
-      continue;
-    }
-    if (!strcmp("-slabpair", argv[i]))
-    {
-      state.slab_width_pair = strtoll(argv[++i], NULL, 0);
-      continue;
-    }
     if (!strcmp("-path", argv[i]))
     {
       snprintf(state.data_path, sizeof(state.data_path), "%s", argv[++i]);
@@ -2034,12 +2199,6 @@ main (int argc, char *argv[])
 
   for (uint64_t i = 0; i < dict.width; i++)
     dict.chains[i] = NULL;
-
-  if (state.slab)
-  {
-    slab_record = slab_create(sizeof(record_t), state.slab_width_record);
-    slab_pair   = slab_create(sizeof(pair_t),   state.slab_width_pair);
-  }
 
   ensure(regcomp(&re_range, RE_RANGE, REG_EXTENDED|REG_NOSUB) == 0)
     errorf("regcomp failed: %s", RE_RANGE);

@@ -1,4 +1,4 @@
 #!/bin/bash
 
 # handle SIGPIPE nostop noprint pass
-gcc -Wall -g -std=c99 -O2 -o n3 n3.c -lpthread
+gcc -Wall -g -std=c99 -O1 -o n3 n3.c -lpthread
