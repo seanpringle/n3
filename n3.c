@@ -44,6 +44,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <time.h>
 #include <pthread.h>
 
+#define PRIME_1000 997
+#define PRIME_10000 9973
+#define PRIME_100000 99991
+#define PRIME_1000000 999983
+
 void
 abort ()
 {
@@ -71,8 +76,8 @@ typedef int (*callback)(void*);
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
-#define POOL 1000000
-#define POOL_CHAINS 9973
+#define POOL 100000
+#define POOL_CHAINS PRIME_1000000
 #define POOL_CHAIN_LIMIT 10
 
 #define E_OK 0
@@ -103,6 +108,12 @@ typedef struct _pool_t {
   FILE *data;
   pool_node_t *chains[POOL_CHAINS];
 } pool_t;
+
+typedef struct _pool_persist_t {
+  size_t size;
+  size_t width;
+  off_t first;
+} pool_persist_t;
 
 typedef struct _pair_t {
   off_t offset;
@@ -143,6 +154,10 @@ typedef struct {
   char data_path[LINE];
   size_t max_packet;
   size_t max_threads;
+  counter_t pool_hits;
+  counter_t pool_misses;
+  counter_t pool_inserts;
+  counter_t pool_prunes;
 } state_t;
 
 typedef struct _self_t {
@@ -273,16 +288,16 @@ release (void *ptr, size_t bytes)
 void
 pool_flush (pool_t *pool)
 {
-  pool_t tmp;
-  memmove(&tmp, pool, sizeof(pool_t));
+  pool_persist_t tmp;
 
-  tmp.head  = NULL;
-  tmp.data  = NULL;
+  tmp.size  = pool->size;
+  tmp.width = pool->width;
+  tmp.first = pool->first;
 
   ensure(fseeko(pool->head, 0, SEEK_SET) == 0)
     errorf("cannot seek %06lu.head", pool->size);
 
-  ensure(fwrite(&tmp, sizeof(pool_t), 1, pool->head) == 1)
+  ensure(fwrite(&tmp, 1, sizeof(pool_persist_t), pool->head) == sizeof(pool_persist_t))
     errorf("cannot write %06lu.head", pool->size);
 }
 
@@ -375,9 +390,9 @@ pool_open (pool_t *pool, size_t size)
     return 0;
   }
 
-  pool_t tmp;
+  pool_persist_t tmp;
 
-  ensure(fread(&tmp, 1, sizeof(pool_t), pool->head) == sizeof(pool_t))
+  ensure(fread(&tmp, 1, sizeof(pool_persist_t), pool->head) == sizeof(pool_persist_t))
     errorf("cannot read pool: %06lu.head", pool->size);
 
   pool->width = tmp.width;
@@ -404,27 +419,20 @@ pool_bubble (pool_t *pool, off_t item)
     *prev = node->next;
     node->next = pool->chains[chain];
     pool->chains[chain] = node;
+    state.pool_hits++;
     return node;
   }
-
+  state.pool_misses++;
   return NULL;
 }
 
 void
 pool_track (pool_t *pool, off_t item, void *ptr)
 {
+  int prune = 0;
   int chain = item % POOL_CHAINS;
-  pool_node_t *node = pool->chains[chain];
-
-  int length = 0;
-  pool_node_t *a = NULL, *b = NULL;
-
-  while (node && node->offset != item)
-  {
-    a = b; b = node;
-    node = node->next;
-    length++;
-  }
+  
+  pool_node_t *node = pool_bubble(pool, item);
 
   if (!node)
   {
@@ -433,15 +441,34 @@ pool_track (pool_t *pool, off_t item, void *ptr)
     node->offset = item;
     node->next = pool->chains[chain];
     pool->chains[chain] = node;
+    prune = 1;
+    state.pool_inserts++;
   }
 
   memmove(node->ptr, ptr, pool->size);
 
-  if (a && b && length > POOL_CHAIN_LIMIT)
+  if (prune)
   {
-    a->next = b->next;
-    release(b->ptr, pool->size);
-    release(b, sizeof(pool_node_t));
+    node = pool->chains[chain];
+
+    int length = 0;
+
+    while (node && length < POOL_CHAIN_LIMIT)
+    {
+      node = node->next;
+      length++;
+    }
+    if (node && length == POOL_CHAIN_LIMIT)
+    {
+      while (node->next)
+      {
+        pool_node_t *drop = node->next;
+        node->next = drop->next;
+        release(drop->ptr, pool->size);
+        release(drop, sizeof(pool_node_t));
+        state.pool_prunes++;
+      }
+    }
   }
 }
 
@@ -503,8 +530,8 @@ pool_alloc (pool_t *pool)
   pool->first = *((off_t*)ptr);
   pool_flush(pool);
 
-  memset(ptr, 0, pool->size);
-  pool_write(pool, item, ptr);
+//  memset(ptr, 0, pool->size);
+//  pool_write(pool, item, ptr);
 
   free(ptr);
   return item;
@@ -516,9 +543,10 @@ pool_free (pool_t *pool, off_t item)
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
-  void *ptr = malloc(pool->size);
+  ensure(item > 0)
+    errorf("attempt to access item 0 in pool: %06lu", pool->size);
 
-  pool_read(pool, item, ptr);
+  void *ptr = malloc(pool->size);
   memset(ptr, 0, pool->size);
 
   *((off_t*)ptr) = pool->first;
@@ -1860,7 +1888,7 @@ done:
 void
 status ()
 {
-  number_t records = 0, pairs = 0, aliases = 0;
+  number_t records = 0, aliases = 0;
 
   respondf("%u 1\n", E_OK);
 
@@ -1868,15 +1896,7 @@ status ()
     record_t *record = store.least;
     record;
     record = record->link, records++
-  )
-  {
-    pair_t _pair;
-    for (
-      pair_t *pair = pair_first(record, &_pair);
-      pair;
-      pair = pair_next(pair), pairs++
-    );
-  }
+  );
 
   for (size_t i = 0; i < dict.width; i++)
   {
@@ -1888,7 +1908,6 @@ status ()
   }
 
   respondf("records %lu", records);
-  respondf(" pairs %lu", pairs);
   respondf(" aliases %lu", aliases);
   respondf(" mem_used %lu", state.mem_used);
   respondf(" mem_limit %lu", state.mem_limit);
@@ -1943,6 +1962,34 @@ status ()
   respondf(" alias_chains_min %lu", chains_min);
   respondf(" alias_chains_max %lu", chains_max);
 
+  chains_avg = 0;
+  chains_min = 0;
+  chains_max = 0;
+
+  for (uint chain = 0; chain < POOL_CHAINS; chain++)
+  {
+    number_t len = 0;
+    for (pool_node_t *node = pool_pair.chains[chain]; node;
+      node = node->next, len++
+    );
+
+    chains_avg += len;
+    if (!chain || len < chains_min) chains_min = len;
+    if (!chain || len > chains_max) chains_max = len;
+  }
+
+  chains_avg /= POOL_CHAINS;
+
+  respondf(" pool_size %lu", pool_pair.size);
+  respondf(" pool_width %lu", pool_pair.width);
+  respondf(" pool_chains %lu", POOL_CHAINS);
+  respondf(" pool_chains_avg %lu", chains_avg);
+  respondf(" pool_chains_min %lu", chains_min);
+  respondf(" pool_chains_max %lu", chains_max);
+  respondf(" pool_hits %lu", state.pool_hits);
+  respondf(" pool_misses %lu", state.pool_misses);
+  respondf(" pool_inserts %lu", state.pool_inserts);
+  respondf(" pool_prunes %lu", state.pool_prunes);
   respondf("\n");
 }
 
@@ -2118,8 +2165,8 @@ main (int argc, char *argv[])
 {
   char scratch[PATH];
 
-  store.width = 9973;
-  dict.width  = 997;
+  store.width = PRIME_10000;
+  dict.width  = PRIME_1000;
 
   state.mem_limit   = 1024 * 1024 * 1024;
   state.max_packet  = 1024 * 1024 * 1;
@@ -2134,8 +2181,8 @@ main (int argc, char *argv[])
 
     if (total_mem > 1024 * 1024 * 1024)
     {
-      store.width = 99991;
-      dict.width  = 9973;
+      store.width = PRIME_100000;
+      dict.width  = PRIME_10000;
     }
 
     state.mem_limit = total_mem * 0.75;
