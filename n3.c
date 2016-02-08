@@ -77,8 +77,7 @@ typedef int (*callback)(void*);
 #define PATH 256
 #define ALIAS 128
 #define POOL 100000
-#define POOL_CHAINS PRIME_1000000
-#define POOL_CHAIN_LIMIT 10
+#define POOL_CACHE 300000
 
 #define E_OK 0
 #define E_PARSE 1
@@ -93,6 +92,7 @@ typedef int (*callback)(void*);
 typedef int (*delimiter)(int);
 typedef uint64_t number_t;
 typedef uint64_t counter_t;
+typedef uint8_t byte_t;
 
 typedef struct _pool_node_t {
   void *ptr;
@@ -106,6 +106,8 @@ typedef struct _pool_t {
   off_t first;
   FILE *head;
   FILE *data;
+  byte_t *cache;
+  size_t cached;
   pthread_mutex_t mutex;
 } pool_t;
 
@@ -222,6 +224,42 @@ FILE *activity;
 store_t store;
 state_t state;
 dict_t dict;
+int multithreaded;
+
+void
+mutex_lock (pthread_mutex_t *mutex)
+{
+  if (multithreaded)
+    pthread_mutex_lock(mutex);
+}
+
+void
+mutex_unlock (pthread_mutex_t *mutex)
+{
+  if (multithreaded)
+    pthread_mutex_unlock(mutex);
+}
+
+void
+rwlock_rdlock (pthread_rwlock_t *rwlock)
+{
+  if (multithreaded)
+    pthread_rwlock_rdlock(rwlock);
+}
+
+void
+rwlock_wrlock (pthread_rwlock_t *rwlock)
+{
+  if (multithreaded)
+    pthread_rwlock_wrlock(rwlock);
+}
+
+void
+rwlock_unlock (pthread_rwlock_t *rwlock)
+{
+  if (multithreaded)
+    pthread_rwlock_unlock(rwlock);
+}
 
 pool_t pool_pair;
 
@@ -255,19 +293,19 @@ regex_t re_alias_get;
 void*
 allocate (size_t bytes)
 {
-  pthread_mutex_lock(&state_mutex);
+  mutex_lock(&state_mutex);
 
   if (state.mem_used + bytes >= state.mem_limit)
   {
     if (!state.mem_limit_hit)
       errorf("hit state.mem_limit %lu", state.mem_limit);
     state.mem_limit_hit++;
-    pthread_mutex_unlock(&state_mutex);
+    mutex_unlock(&state_mutex);
     return NULL;
   }
 
   state.mem_used += bytes;
-  pthread_mutex_unlock(&state_mutex);
+  mutex_unlock(&state_mutex);
   return malloc(bytes);
 }
 
@@ -276,15 +314,57 @@ release (void *ptr, size_t bytes)
 {
   if (ptr)
   {
-    pthread_mutex_lock(&state_mutex);
+    mutex_lock(&state_mutex);
 
     ensure(state.mem_used >= bytes)
       errorf("bad state.mem_used");
 
     state.mem_used -= bytes;
-    pthread_mutex_unlock(&state_mutex);
+    mutex_unlock(&state_mutex);
     free(ptr);
   }
+}
+
+pool_node_t*
+cache_lookup (off_t item)
+{
+  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  {
+    if (node->offset == item)
+      return node;
+  }
+  return NULL;
+}
+
+void
+cache_empty ()
+{
+  int count = 0;
+  for (int i = 0; i < PRIME_1000; i++)
+  {
+    for (pool_node_t *next = NULL, *node = self->pool_cache->chains[i]; node; node = next)
+    {
+      next = node->next;
+      release(node->ptr, sizeof(pair_t));
+      release(node, sizeof(pool_node_t));
+      count++;
+    }
+    self->pool_cache->chains[i] = NULL;
+  }
+  self->pool_cache->count = 0;
+  //errorf("cache_empty() %d", count);
+}
+
+void
+cache_insert (off_t item, void *ptr)
+{
+  pool_node_t *node = allocate(sizeof(pool_node_t));
+  node->offset = item;
+  node->next = self->pool_cache->chains[item % PRIME_1000];
+  self->pool_cache->chains[item % PRIME_1000] = node;
+  node->ptr = allocate(sizeof(pair_t));
+  memmove(node->ptr, ptr, sizeof(pair_t));
+  self->pool_cache->count++;
 }
 
 void
@@ -360,8 +440,10 @@ pool_init (size_t size)
   ensure((pool->data = fopen(scratch, "w")))
     errorf("cannot create pool: %06lu.data", pool->size);
 
-  pool_extend(pool);
-  pool->first++;
+  while (pool->width * pool->size < POOL_CACHE * pool->size)
+    pool_extend(pool);
+
+  pool->first = 1;
 
   pool_flush(pool);
 
@@ -369,6 +451,18 @@ pool_init (size_t size)
   fclose(pool->data);
 
   release(pool, sizeof(pool_t));
+}
+
+void
+pool_preload (pool_t *pool)
+{
+  off_t offset = pool->width * pool->size - pool->cached;
+
+  ensure(fseeko(pool->data, offset, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data (offset %lu)", pool->size, offset);
+
+  ensure(fread(pool->cache, 1, pool->cached, pool->data) == pool->cached)
+    errorf("cannot read pool: %06lu.data", pool->size);
 }
 
 int
@@ -402,10 +496,27 @@ pool_open (pool_t *pool, size_t size)
 
   pool->width = tmp.width;
   pool->first = tmp.first;
+  pool->cached = POOL_CACHE * pool->size;
+
+  ensure((pool->cache = allocate(pool->cached)) && pool->cache)
+  {
+    errorf("cannot allocate pool memory: %06lu (%lu bytes)", pool->size, pool->cached);
+    return 0;
+  }
+
+  pool_preload(pool);
 
   pthread_mutex_init(&pool->mutex, NULL);
 
   return 1;
+}
+
+byte_t*
+pool_offset_cached (pool_t *pool, off_t item)
+{
+  off_t item_offset  = item * pool->size;
+  off_t cache_offset = pool->width * pool->size - pool->cached;
+  return (item_offset > cache_offset) ? pool->cache + (item_offset - cache_offset): NULL;
 }
 
 void
@@ -417,6 +528,14 @@ pool_read_raw (pool_t *pool, off_t item, void *ptr)
   ensure(item > 0)
     errorf("attempt to access item 0 in pool: %06lu", pool->size);
 
+  byte_t *cached = pool_offset_cached(pool, item);
+
+  if (cached)
+  {
+    memmove(ptr, cached, pool->size);
+    return;
+  }
+
   ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
     errorf("cannot seek pool: %06lu.data", pool->size);
 
@@ -424,61 +543,12 @@ pool_read_raw (pool_t *pool, off_t item, void *ptr)
     errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
 }
 
-pool_node_t*
-cache_lookup (off_t item)
-{
-  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
-  {
-    if (node->offset == item)
-      return node;
-  }
-  return NULL;
-}
-
-void
-cache_empty ()
-{
-  int count = 0;
-  for (int i = 0; i < PRIME_1000; i++)
-  {
-    for (pool_node_t *next = NULL, *node = self->pool_cache->chains[i]; node; node = next)
-    {
-      next = node->next;
-      release(node->ptr, sizeof(pair_t));
-      release(node, sizeof(pool_node_t));
-      count++;
-    }
-    self->pool_cache->chains[i] = NULL;
-  }
-  self->pool_cache->count = 0;
-  //errorf("cache_empty() %d", count);
-}
-
-void
-cache_insert (off_t item, void *ptr)
-{
-  pool_node_t *node = allocate(sizeof(pool_node_t));
-  node->offset = item;
-  node->next = self->pool_cache->chains[item % PRIME_1000];
-  self->pool_cache->chains[item % PRIME_1000] = node;
-  node->ptr = allocate(sizeof(pair_t));
-  memmove(node->ptr, ptr, sizeof(pair_t));
-  self->pool_cache->count++;
-}
-
 void
 pool_read (pool_t *pool, off_t item, void *ptr)
 {
-  pool_node_t *node;
-  if ((node = cache_lookup(item)) && node)
-  {
-    memmove(ptr, node->ptr, sizeof(pair_t));
-    return;
-  }
-  pthread_mutex_lock(&pool->mutex);
+  mutex_lock(&pool->mutex);
   pool_read_raw(pool, item, ptr);
-  pthread_mutex_unlock(&pool->mutex);
-  cache_insert(item, ptr);
+  mutex_unlock(&pool->mutex);
 }
 
 void
@@ -495,31 +565,34 @@ pool_write_raw (pool_t *pool, off_t item, void *ptr)
 
   ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
     errorf("cannot write pool: %06lu.head", pool->size);
+
+  byte_t *cached = pool_offset_cached(pool, item);
+
+  if (cached)
+  {
+    memmove(cached, ptr, pool->size);
+    return;
+  }
 }
 
 void
 pool_write (pool_t *pool, off_t item, void *ptr)
 {
-  pthread_mutex_lock(&pool->mutex);
+  mutex_lock(&pool->mutex);
   pool_write_raw(pool, item, ptr);
-  pthread_mutex_unlock(&pool->mutex);
-
-  pool_node_t *node;
-  if ((node = cache_lookup(item)) && node)
-  {
-    memmove(node->ptr, ptr, sizeof(pair_t));
-    return;
-  }
-  cache_insert(item, ptr);
+  mutex_unlock(&pool->mutex);
 }
 
 off_t
 pool_alloc (pool_t *pool)
 {
-  pthread_mutex_lock(&pool->mutex);
+  mutex_lock(&pool->mutex);
 
   if (!pool->first)
+  {
     pool_extend(pool);
+    pool_preload(pool);
+  }
 
   void *ptr = malloc(pool->size);
   off_t item = pool->first;
@@ -527,10 +600,10 @@ pool_alloc (pool_t *pool)
   pool_read_raw(pool, item, ptr);
 
   pool->first = *((off_t*)ptr);
-  pool_flush(pool);
+  //pool_flush(pool);
   free(ptr);
 
-  pthread_mutex_unlock(&pool->mutex);
+  mutex_unlock(&pool->mutex);
   return item;
 }
 
@@ -549,12 +622,12 @@ pool_free (pool_t *pool, off_t item)
   *((off_t*)ptr) = pool->first;
   pool->first = item;
 
-  pool_flush(pool);
+  //pool_flush(pool);
   pool_write_raw(pool, item, ptr);
 
   free(ptr);
 
-  pthread_mutex_unlock(&pool->mutex);
+  mutex_unlock(&pool->mutex);
 }
 
 int
@@ -632,7 +705,7 @@ alias_set (char *str, number_t num)
   uint32_t hash = 5381;
   for (int i = 0; str[i]; hash = hash * 33 + str[i++]);
 
-  pthread_mutex_lock(&alias_mutex);
+  mutex_lock(&alias_mutex);
 
   alias_t *alias = dict.chains[hash % dict.width];
 
@@ -665,7 +738,7 @@ alias_set (char *str, number_t num)
   }
 
   alias->num = num;
-  pthread_mutex_unlock(&alias_mutex);
+  mutex_unlock(&alias_mutex);
 
   return rc;
 }
@@ -676,7 +749,7 @@ alias_get (char *str, number_t *num)
   uint32_t hash = 5381;
   for (int i = 0; str[i]; hash = hash * 33 + str[i++]);
 
-  pthread_mutex_lock(&alias_mutex);
+  mutex_lock(&alias_mutex);
 
   alias_t *alias = dict.chains[hash % dict.width];
 
@@ -688,7 +761,7 @@ alias_get (char *str, number_t *num)
   int rc = alias ? 1:0;
   *num = alias ? alias->num: 0;
 
-  pthread_mutex_unlock(&alias_mutex);
+  mutex_unlock(&alias_mutex);
 
   return rc;
 }
@@ -899,7 +972,7 @@ respondf (const char *pattern, ...)
 void
 activityf(const char *pattern, ...)
 {
-  pthread_mutex_lock(&activity_mutex);
+  mutex_lock(&activity_mutex);
 
   if (activity)
   {
@@ -911,7 +984,7 @@ activityf(const char *pattern, ...)
     fflush(activity);
   }
 
-  pthread_mutex_unlock(&activity_mutex);
+  mutex_unlock(&activity_mutex);
 }
 
 int
@@ -982,7 +1055,7 @@ parse_insert (char *line)
       return;
     }
 
-    pthread_rwlock_wrlock(&rwlock);
+    rwlock_wrlock(&rwlock);
     record_t *record = record_get(id);
 
     if (!record)
@@ -996,7 +1069,7 @@ parse_insert (char *line)
         if (rc == 1)
           activityf("%u %lu %lu %lu", O_INSERT, id, key, val);
 
-        pthread_rwlock_unlock(&rwlock);
+        rwlock_unlock(&rwlock);
         continue;
       }
       if (!record->pairs)
@@ -1005,7 +1078,7 @@ parse_insert (char *line)
       }
     }
 
-    pthread_rwlock_unlock(&rwlock);
+    rwlock_unlock(&rwlock);
     respondf("%u %s %d\n", E_SERVER, __func__, __LINE__);
     return;
   }
@@ -1246,7 +1319,7 @@ respond_row (query_t *query)
 void
 parse_select (char *line)
 {
-  pthread_rwlock_rdlock(&rwlock);
+  rwlock_rdlock(&rwlock);
 
   query_t select, *query =& select;
   memset(query, 0, sizeof(query_t));
@@ -1674,13 +1747,13 @@ val_fail:
 
 done:
   fields_release(query);
-  pthread_rwlock_unlock(&rwlock);
+  rwlock_unlock(&rwlock);
 }
 
 void
 parse_delete (char *line)
 {
-  pthread_rwlock_wrlock(&rwlock);
+  rwlock_wrlock(&rwlock);
   int deleted_records = 0;
   int deleted_pairs = 0;
   int field_count = 0;
@@ -1808,13 +1881,13 @@ key_fail:
 
 done:
   fields_release(query);
-  pthread_rwlock_unlock(&rwlock);
+  rwlock_unlock(&rwlock);
 }
 
 void
 parse_alias (char *line)
 {
-  pthread_rwlock_wrlock(&rwlock);
+  rwlock_wrlock(&rwlock);
 
   if (regmatch(&re_alias_get, line))
   {
@@ -1844,13 +1917,13 @@ parse_alias (char *line)
   respondf("%u unknown syntax: %s\n", E_PARSE, line);
 
 done:
-  pthread_rwlock_unlock(&rwlock);
+  rwlock_unlock(&rwlock);
 }
 
 void
 parse_match (char *line)
 {
-  pthread_rwlock_rdlock(&rwlock);
+  rwlock_rdlock(&rwlock);
 
   regex_t re;
 
@@ -1885,7 +1958,7 @@ parse_match (char *line)
   regfree(&re);
 
 done:
-  pthread_rwlock_unlock(&rwlock);
+  rwlock_unlock(&rwlock);
 }
 
 void
@@ -1976,7 +2049,7 @@ consolidate ()
   int rc = E_OK;
   char scratch[PATH];
 
-  pthread_mutex_lock(&activity_mutex);
+  mutex_lock(&activity_mutex);
 
   fclose(activity);
 
@@ -2021,7 +2094,7 @@ consolidate ()
   fclose(aliases);
 
 done:
-  pthread_mutex_unlock(&activity_mutex);
+  mutex_unlock(&activity_mutex);
   respondf("%u\n", rc);
 }
 
@@ -2145,6 +2218,7 @@ int
 main (int argc, char *argv[])
 {
   char scratch[PATH];
+  multithreaded = 0;
 
   store.width = PRIME_10000;
   dict.width  = PRIME_1000;
@@ -2306,6 +2380,8 @@ main (int argc, char *argv[])
     errorf("listen failed");
 
   errorf("ready");
+
+  multithreaded = 1;
 
   int thread_fds[state.max_threads];
   memset(thread_fds, 0, sizeof(thread_fds));
