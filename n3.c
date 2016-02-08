@@ -428,7 +428,7 @@ pool_read_raw (pool_t *pool, off_t item, void *ptr)
 }
 
 void
-pool_uncache(pool_t *pool)
+pool_uncache (pool_t *pool)
 {
   int count = 0;
   for (int i = 0; i < PRIME_1000; i++)
@@ -446,6 +446,17 @@ pool_uncache(pool_t *pool)
 }
 
 void
+pool_cache (pool_t *pool, off_t item, void *ptr)
+{
+  pool_node_t *node = allocate(sizeof(pool_node_t));
+  node->offset = item;
+  node->next = self->pool_cache->chains[item % PRIME_1000];
+  self->pool_cache->chains[item % PRIME_1000] = node;
+  node->ptr = allocate(sizeof(pair_t));
+  memmove(node->ptr, ptr, sizeof(pair_t));
+}
+
+void
 pool_read (pool_t *pool, off_t item, void *ptr)
 {
   for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
@@ -459,14 +470,7 @@ pool_read (pool_t *pool, off_t item, void *ptr)
   pthread_rwlock_wrlock(&pool->rwlock);
   pool_read_raw(pool, item, ptr);
   pthread_rwlock_unlock(&pool->rwlock);
-
-  pool_node_t *node = allocate(sizeof(pool_node_t));
-  node->offset = item;
-  node->next = self->pool_cache->chains[item % PRIME_1000];
-  self->pool_cache->chains[item % PRIME_1000] = node;
-
-  node->ptr = allocate(sizeof(pair_t));
-  memmove(node->ptr, ptr, sizeof(pair_t));
+  pool_cache(pool, item, ptr);
 }
 
 void
@@ -496,18 +500,11 @@ pool_write (pool_t *pool, off_t item, void *ptr)
   {
     if (node->offset == item)
     {
-      memmove(ptr, node->ptr, sizeof(pair_t));
+      memmove(node->ptr, ptr, sizeof(pair_t));
       return;
     }
   }
-
-  pool_node_t *node = allocate(sizeof(pool_node_t));
-  node->offset = item;
-  node->next = self->pool_cache->chains[item % PRIME_1000];
-  self->pool_cache->chains[item % PRIME_1000] = node;
-
-  node->ptr = allocate(sizeof(pair_t));
-  memmove(node->ptr, ptr, sizeof(pair_t));
+  pool_cache(pool, item, ptr);
 }
 
 off_t
