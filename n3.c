@@ -339,7 +339,8 @@ pool_init (size_t size)
 {
   char scratch[100];
 
-  pool_t _pool, *pool = &_pool;
+  pool_t *pool = allocate(sizeof(pool_t));
+
   pool->size  = size;
   pool->width = 0;
   pool->first = 0;
@@ -365,6 +366,8 @@ pool_init (size_t size)
 
   fclose(pool->head);
   fclose(pool->data);
+
+  release(pool, sizeof(pool_t));
 }
 
 int
