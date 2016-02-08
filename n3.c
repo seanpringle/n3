@@ -431,7 +431,7 @@ pool_track (pool_t *pool, off_t item, void *ptr)
 {
   int prune = 0;
   int chain = item % POOL_CHAINS;
-  
+
   pool_node_t *node = pool_bubble(pool, item);
 
   if (!node)
@@ -1247,7 +1247,7 @@ respond_row (query_t *query)
 void
 parse_select (char *line)
 {
-  pthread_rwlock_rdlock(&rwlock);
+  pthread_rwlock_wrlock(&rwlock);
 
   query_t select, *query =& select;
   memset(query, 0, sizeof(query_t));
@@ -1847,7 +1847,7 @@ done:
 void
 parse_match (char *line)
 {
-  pthread_rwlock_rdlock(&rwlock);
+  pthread_rwlock_wrlock(&rwlock);
 
   regex_t re;
 
