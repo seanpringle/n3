@@ -1523,6 +1523,7 @@ parse_select (char *line)
       }
 
       query->handler(query);
+      pool_uncache(&pool_pair);
     }
   }
   else
@@ -1586,6 +1587,7 @@ parse_select (char *line)
       }
 
       query->handler(query);
+      pool_uncache(&pool_pair);
     }
   }
   else
@@ -1642,6 +1644,7 @@ parse_select (char *line)
         field->cleanup(query, field);
       }
       query->handler(query);
+      pool_uncache(&pool_pair);
     }
   }
 
@@ -1759,6 +1762,7 @@ parse_delete (char *line)
           deleted_records++;
         }
         record = next;
+        pool_uncache(&pool_pair);
       }
 
       if (deleted_records || deleted_pairs)
