@@ -107,6 +107,7 @@ typedef struct _pool_t {
   FILE *head;
   FILE *data;
   pool_node_t *chains[POOL_CHAINS];
+  pthread_mutex_t mutexes[POOL_CHAINS];
 } pool_t;
 
 typedef struct _pool_persist_t {
@@ -399,7 +400,10 @@ pool_open (pool_t *pool, size_t size)
   pool->first = tmp.first;
 
   for (int i = 0; i < POOL_CHAINS; i++)
+  {
     pool->chains[i] = NULL;
+    pthread_mutex_init(&pool->mutexes[i], NULL);
+  }
 
   return 1;
 }
@@ -475,6 +479,8 @@ pool_track (pool_t *pool, off_t item, void *ptr)
 void
 pool_read (pool_t *pool, off_t item, void *ptr)
 {
+  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
+
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -483,7 +489,7 @@ pool_read (pool_t *pool, off_t item, void *ptr)
   if (node)
   {
     memmove(ptr, node->ptr, pool->size);
-    return;
+    goto done;
   }
 
   ensure(item > 0)
@@ -496,11 +502,16 @@ pool_read (pool_t *pool, off_t item, void *ptr)
     errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
 
   pool_track(pool, item, ptr);
+
+done:
+  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
 }
 
 void
 pool_write (pool_t *pool, off_t item, void *ptr)
 {
+  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
+
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -514,6 +525,8 @@ pool_write (pool_t *pool, off_t item, void *ptr)
     errorf("cannot write pool: %06lu.head", pool->size);
 
   pool_track(pool, item, ptr);
+
+  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
 }
 
 off_t
@@ -540,6 +553,8 @@ pool_alloc (pool_t *pool)
 void
 pool_free (pool_t *pool, off_t item)
 {
+  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
+
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -556,6 +571,8 @@ pool_free (pool_t *pool, off_t item)
   pool_write(pool, item, ptr);
 
   free(ptr);
+
+  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
 }
 
 int
@@ -1247,7 +1264,7 @@ respond_row (query_t *query)
 void
 parse_select (char *line)
 {
-  pthread_rwlock_wrlock(&rwlock);
+  pthread_rwlock_rdlock(&rwlock);
 
   query_t select, *query =& select;
   memset(query, 0, sizeof(query_t));
@@ -1847,7 +1864,7 @@ done:
 void
 parse_match (char *line)
 {
-  pthread_rwlock_wrlock(&rwlock);
+  pthread_rwlock_rdlock(&rwlock);
 
   regex_t re;
 
