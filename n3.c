@@ -154,14 +154,11 @@ typedef struct {
   char data_path[LINE];
   size_t max_packet;
   size_t max_threads;
-  counter_t pool_hits;
-  counter_t pool_misses;
-  counter_t pool_inserts;
-  counter_t pool_prunes;
 } state_t;
 
 typedef struct _pool_cache_t {
   pool_node_t *chains[PRIME_1000];
+  counter_t count;
 } pool_cache_t;
 
 typedef struct _self_t {
@@ -427,8 +424,19 @@ pool_read_raw (pool_t *pool, off_t item, void *ptr)
     errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
 }
 
+pool_node_t*
+cache_lookup (off_t item)
+{
+  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  {
+    if (node->offset == item)
+      return node;
+  }
+  return NULL;
+}
+
 void
-pool_uncache (pool_t *pool)
+cache_empty ()
 {
   int count = 0;
   for (int i = 0; i < PRIME_1000; i++)
@@ -442,11 +450,12 @@ pool_uncache (pool_t *pool)
     }
     self->pool_cache->chains[i] = NULL;
   }
-  //errorf("pool_uncache %d", count);
+  self->pool_cache->count = 0;
+  //errorf("cache_empty() %d", count);
 }
 
 void
-pool_cache (pool_t *pool, off_t item, void *ptr)
+cache_insert (off_t item, void *ptr)
 {
   pool_node_t *node = allocate(sizeof(pool_node_t));
   node->offset = item;
@@ -454,23 +463,22 @@ pool_cache (pool_t *pool, off_t item, void *ptr)
   self->pool_cache->chains[item % PRIME_1000] = node;
   node->ptr = allocate(sizeof(pair_t));
   memmove(node->ptr, ptr, sizeof(pair_t));
+  self->pool_cache->count++;
 }
 
 void
 pool_read (pool_t *pool, off_t item, void *ptr)
 {
-  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  pool_node_t *node;
+  if ((node = cache_lookup(item)) && node)
   {
-    if (node->offset == item)
-    {
-      memmove(ptr, node->ptr, sizeof(pair_t));
-      return;
-    }
+    memmove(ptr, node->ptr, sizeof(pair_t));
+    return;
   }
   pthread_mutex_lock(&pool->mutex);
   pool_read_raw(pool, item, ptr);
   pthread_mutex_unlock(&pool->mutex);
-  pool_cache(pool, item, ptr);
+  cache_insert(item, ptr);
 }
 
 void
@@ -496,15 +504,13 @@ pool_write (pool_t *pool, off_t item, void *ptr)
   pool_write_raw(pool, item, ptr);
   pthread_mutex_unlock(&pool->mutex);
 
-  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  pool_node_t *node;
+  if ((node = cache_lookup(item)) && node)
   {
-    if (node->offset == item)
-    {
-      memmove(node->ptr, ptr, sizeof(pair_t));
-      return;
-    }
+    memmove(node->ptr, ptr, sizeof(pair_t));
+    return;
   }
-  pool_cache(pool, item, ptr);
+  cache_insert(item, ptr);
 }
 
 off_t
@@ -1523,7 +1529,7 @@ parse_select (char *line)
       }
 
       query->handler(query);
-      pool_uncache(&pool_pair);
+      cache_empty();
     }
   }
   else
@@ -1587,7 +1593,7 @@ parse_select (char *line)
       }
 
       query->handler(query);
-      pool_uncache(&pool_pair);
+      cache_empty();
     }
   }
   else
@@ -1644,7 +1650,7 @@ parse_select (char *line)
         field->cleanup(query, field);
       }
       query->handler(query);
-      pool_uncache(&pool_pair);
+      cache_empty();
     }
   }
 
@@ -1762,7 +1768,7 @@ parse_delete (char *line)
           deleted_records++;
         }
         record = next;
-        pool_uncache(&pool_pair);
+        cache_empty();
       }
 
       if (deleted_records || deleted_pairs)
@@ -1961,10 +1967,6 @@ status ()
 
   respondf(" pool_size %lu", pool_pair.size);
   respondf(" pool_width %lu", pool_pair.width);
-  respondf(" pool_hits %lu", state.pool_hits);
-  respondf(" pool_misses %lu", state.pool_misses);
-  respondf(" pool_inserts %lu", state.pool_inserts);
-  respondf(" pool_prunes %lu", state.pool_prunes);
   respondf("\n");
 }
 
@@ -2086,7 +2088,7 @@ parse (char *line)
   {
     respondf("%u unknown: %s\n", E_PARSE, line);
   }
-  pool_uncache(&pool_pair);
+  cache_empty();
 }
 
 void*
@@ -2130,7 +2132,7 @@ client (void *ptr)
 
 done:
 
-  pool_uncache(&pool_pair);
+  cache_empty();
   close(self->response);
   release(packet, state.max_packet);
 
