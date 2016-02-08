@@ -106,8 +106,7 @@ typedef struct _pool_t {
   off_t first;
   FILE *head;
   FILE *data;
-  pool_node_t *chains[POOL_CHAINS];
-  pthread_mutex_t mutexes[POOL_CHAINS];
+  pthread_rwlock_t rwlock;
 } pool_t;
 
 typedef struct _pool_persist_t {
@@ -161,8 +160,13 @@ typedef struct {
   counter_t pool_prunes;
 } state_t;
 
+typedef struct _pool_cache_t {
+  pool_node_t *chains[PRIME_1000];
+} pool_cache_t;
+
 typedef struct _self_t {
   int response;
+  pool_cache_t *pool_cache;
 } self_t;
 
 struct _field_t;
@@ -402,98 +406,16 @@ pool_open (pool_t *pool, size_t size)
   pool->width = tmp.width;
   pool->first = tmp.first;
 
-  for (int i = 0; i < POOL_CHAINS; i++)
-  {
-    pool->chains[i] = NULL;
-    pthread_mutex_init(&pool->mutexes[i], NULL);
-  }
+  pthread_rwlock_init(&pool->rwlock, NULL);
 
   return 1;
 }
 
-void*
-pool_bubble (pool_t *pool, off_t item)
-{
-  int chain = item % POOL_CHAINS;
-  pool_node_t **prev = &pool->chains[chain];
-
-  while (*prev && (*prev)->offset != item)
-    prev = &((*prev)->next);
-
-  if (*prev)
-  {
-    pool_node_t *node = *prev;
-    *prev = node->next;
-    node->next = pool->chains[chain];
-    pool->chains[chain] = node;
-    state.pool_hits++;
-    return node;
-  }
-  state.pool_misses++;
-  return NULL;
-}
-
 void
-pool_track (pool_t *pool, off_t item, void *ptr)
+pool_read_raw (pool_t *pool, off_t item, void *ptr)
 {
-  int prune = 0;
-  int chain = item % POOL_CHAINS;
-
-  pool_node_t *node = pool_bubble(pool, item);
-
-  if (!node)
-  {
-    node = allocate(sizeof(pool_node_t));
-    node->ptr = allocate(pool->size);
-    node->offset = item;
-    node->next = pool->chains[chain];
-    pool->chains[chain] = node;
-    prune = 1;
-    state.pool_inserts++;
-  }
-
-  memmove(node->ptr, ptr, pool->size);
-
-  if (prune)
-  {
-    node = pool->chains[chain];
-
-    int length = 0;
-
-    while (node && length < POOL_CHAIN_LIMIT)
-    {
-      node = node->next;
-      length++;
-    }
-    if (node && length == POOL_CHAIN_LIMIT)
-    {
-      while (node->next)
-      {
-        pool_node_t *drop = node->next;
-        node->next = drop->next;
-        release(drop->ptr, pool->size);
-        release(drop, sizeof(pool_node_t));
-        state.pool_prunes++;
-      }
-    }
-  }
-}
-
-void
-pool_read (pool_t *pool, off_t item, void *ptr)
-{
-  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
-
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
-
-  pool_node_t *node = pool_bubble(pool, item);
-
-  if (node)
-  {
-    memmove(ptr, node->ptr, pool->size);
-    goto done;
-  }
 
   ensure(item > 0)
     errorf("attempt to access item 0 in pool: %06lu", pool->size);
@@ -503,18 +425,53 @@ pool_read (pool_t *pool, off_t item, void *ptr)
 
   ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
     errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
-
-  pool_track(pool, item, ptr);
-
-done:
-  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
 }
 
 void
-pool_write (pool_t *pool, off_t item, void *ptr)
+pool_uncache(pool_t *pool)
 {
-  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
+  int count = 0;
+  for (int i = 0; i < PRIME_1000; i++)
+  {
+    for (pool_node_t *next = NULL, *node = self->pool_cache->chains[i]; node; node = next)
+    {
+      next = node->next;
+      release(node->ptr, sizeof(pair_t));
+      release(node, sizeof(pool_node_t));
+      count++;
+    }
+    self->pool_cache->chains[i] = NULL;
+  }
+  //errorf("pool_uncache %d", count);
+}
 
+void
+pool_read (pool_t *pool, off_t item, void *ptr)
+{
+  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  {
+    if (node->offset == item)
+    {
+      memmove(ptr, node->ptr, sizeof(pair_t));
+      return;
+    }
+  }
+  pthread_rwlock_wrlock(&pool->rwlock);
+  pool_read_raw(pool, item, ptr);
+  pthread_rwlock_unlock(&pool->rwlock);
+
+  pool_node_t *node = allocate(sizeof(pool_node_t));
+  node->offset = item;
+  node->next = self->pool_cache->chains[item % PRIME_1000];
+  self->pool_cache->chains[item % PRIME_1000] = node;
+
+  node->ptr = allocate(sizeof(pair_t));
+  memmove(node->ptr, ptr, sizeof(pair_t));
+}
+
+void
+pool_write_raw (pool_t *pool, off_t item, void *ptr)
+{
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -526,38 +483,57 @@ pool_write (pool_t *pool, off_t item, void *ptr)
 
   ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
     errorf("cannot write pool: %06lu.head", pool->size);
+}
 
-  pool_track(pool, item, ptr);
+void
+pool_write (pool_t *pool, off_t item, void *ptr)
+{
+  pthread_rwlock_wrlock(&pool->rwlock);
+  pool_write_raw(pool, item, ptr);
+  pthread_rwlock_unlock(&pool->rwlock);
 
-  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
+  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
+  {
+    if (node->offset == item)
+    {
+      memmove(ptr, node->ptr, sizeof(pair_t));
+      return;
+    }
+  }
+
+  pool_node_t *node = allocate(sizeof(pool_node_t));
+  node->offset = item;
+  node->next = self->pool_cache->chains[item % PRIME_1000];
+  self->pool_cache->chains[item % PRIME_1000] = node;
+
+  node->ptr = allocate(sizeof(pair_t));
+  memmove(node->ptr, ptr, sizeof(pair_t));
 }
 
 off_t
 pool_alloc (pool_t *pool)
 {
+  pthread_rwlock_wrlock(&pool->rwlock);
+
   if (!pool->first)
     pool_extend(pool);
 
   void *ptr = malloc(pool->size);
   off_t item = pool->first;
 
-  pool_read(pool, item, ptr);
+  pool_read_raw(pool, item, ptr);
 
   pool->first = *((off_t*)ptr);
   pool_flush(pool);
-
-//  memset(ptr, 0, pool->size);
-//  pool_write(pool, item, ptr);
-
   free(ptr);
+
+  pthread_rwlock_unlock(&pool->rwlock);
   return item;
 }
 
 void
 pool_free (pool_t *pool, off_t item)
 {
-  pthread_mutex_lock(&pool->mutexes[item % POOL_CHAINS]);
-
   ensure(item < pool->width)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -571,11 +547,11 @@ pool_free (pool_t *pool, off_t item)
   pool->first = item;
 
   pool_flush(pool);
-  pool_write(pool, item, ptr);
+  pool_write_raw(pool, item, ptr);
 
   free(ptr);
 
-  pthread_mutex_unlock(&pool->mutexes[item % POOL_CHAINS]);
+  pthread_rwlock_unlock(&pool->rwlock);
 }
 
 int
@@ -1982,30 +1958,8 @@ status ()
   respondf(" alias_chains_min %lu", chains_min);
   respondf(" alias_chains_max %lu", chains_max);
 
-  chains_avg = 0;
-  chains_min = 0;
-  chains_max = 0;
-
-  for (uint chain = 0; chain < POOL_CHAINS; chain++)
-  {
-    number_t len = 0;
-    for (pool_node_t *node = pool_pair.chains[chain]; node;
-      node = node->next, len++
-    );
-
-    chains_avg += len;
-    if (!chain || len < chains_min) chains_min = len;
-    if (!chain || len > chains_max) chains_max = len;
-  }
-
-  chains_avg /= POOL_CHAINS;
-
   respondf(" pool_size %lu", pool_pair.size);
   respondf(" pool_width %lu", pool_pair.width);
-  respondf(" pool_chains %lu", POOL_CHAINS);
-  respondf(" pool_chains_avg %lu", chains_avg);
-  respondf(" pool_chains_min %lu", chains_min);
-  respondf(" pool_chains_max %lu", chains_max);
   respondf(" pool_hits %lu", state.pool_hits);
   respondf(" pool_misses %lu", state.pool_misses);
   respondf(" pool_inserts %lu", state.pool_inserts);
@@ -2131,6 +2085,7 @@ parse (char *line)
   {
     respondf("%u unknown: %s\n", E_PARSE, line);
   }
+  pool_uncache(&pool_pair);
 }
 
 void*
@@ -2140,6 +2095,7 @@ client (void *ptr)
   pthread_setspecific(keyself, &_self);
 
   self->response = *((int*)ptr);
+  self->pool_cache = calloc(1, sizeof(pool_cache_t));
 
   char *packet = allocate(state.max_packet);
 
@@ -2172,6 +2128,8 @@ client (void *ptr)
   }
 
 done:
+
+  pool_uncache(&pool_pair);
   close(self->response);
   release(packet, state.max_packet);
 
@@ -2291,6 +2249,7 @@ main (int argc, char *argv[])
   char *packet = allocate(state.max_packet);
 
   self->response = 0;
+  self->pool_cache = calloc(PRIME_1000, sizeof(pool_cache_t));
   activity = NULL;
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
