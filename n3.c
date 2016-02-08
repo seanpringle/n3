@@ -106,7 +106,7 @@ typedef struct _pool_t {
   off_t first;
   FILE *head;
   FILE *data;
-  pthread_rwlock_t rwlock;
+  pthread_mutex_t mutex;
 } pool_t;
 
 typedef struct _pool_persist_t {
@@ -406,7 +406,7 @@ pool_open (pool_t *pool, size_t size)
   pool->width = tmp.width;
   pool->first = tmp.first;
 
-  pthread_rwlock_init(&pool->rwlock, NULL);
+  pthread_mutex_init(&pool->mutex, NULL);
 
   return 1;
 }
@@ -467,9 +467,9 @@ pool_read (pool_t *pool, off_t item, void *ptr)
       return;
     }
   }
-  pthread_rwlock_wrlock(&pool->rwlock);
+  pthread_mutex_lock(&pool->mutex);
   pool_read_raw(pool, item, ptr);
-  pthread_rwlock_unlock(&pool->rwlock);
+  pthread_mutex_unlock(&pool->mutex);
   pool_cache(pool, item, ptr);
 }
 
@@ -492,9 +492,9 @@ pool_write_raw (pool_t *pool, off_t item, void *ptr)
 void
 pool_write (pool_t *pool, off_t item, void *ptr)
 {
-  pthread_rwlock_wrlock(&pool->rwlock);
+  pthread_mutex_lock(&pool->mutex);
   pool_write_raw(pool, item, ptr);
-  pthread_rwlock_unlock(&pool->rwlock);
+  pthread_mutex_unlock(&pool->mutex);
 
   for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
   {
@@ -510,7 +510,7 @@ pool_write (pool_t *pool, off_t item, void *ptr)
 off_t
 pool_alloc (pool_t *pool)
 {
-  pthread_rwlock_wrlock(&pool->rwlock);
+  pthread_mutex_lock(&pool->mutex);
 
   if (!pool->first)
     pool_extend(pool);
@@ -524,7 +524,7 @@ pool_alloc (pool_t *pool)
   pool_flush(pool);
   free(ptr);
 
-  pthread_rwlock_unlock(&pool->rwlock);
+  pthread_mutex_unlock(&pool->mutex);
   return item;
 }
 
@@ -548,7 +548,7 @@ pool_free (pool_t *pool, off_t item)
 
   free(ptr);
 
-  pthread_rwlock_unlock(&pool->rwlock);
+  pthread_mutex_unlock(&pool->mutex);
 }
 
 int
