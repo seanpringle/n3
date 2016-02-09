@@ -553,11 +553,11 @@ pair_first (record_t *record, pair_t *pair)
 }
 
 pair_t*
-pair_next (pair_t *pair)
+pair_next (pair_t *pair, pair_t *tmp)
 {
   if (pair && pair->sibling)
   {
-    return pool_read(&pool_pair, pair->sibling, pair);
+    return pool_read(&pool_pair, pair->sibling, tmp);
   }
   return NULL;
 }
@@ -568,7 +568,7 @@ pair_insert (record_t *record, number_t key, number_t val)
   pair_t _pair, *pair = pair_first(record, &_pair);
 
   while (pair && pair->key != key)
-    pair = pair_next(pair);
+    pair = pair_next(pair, &_pair);
 
   if (pair && pair->val == val)
     return 2;
@@ -602,7 +602,7 @@ pair_delete (record_t *record, number_t key)
   while (pair && pair->key != key)
   {
     memmove(&pair2, &pair1, sizeof(pair_t));
-    pair = pair_next(pair);
+    pair = pair_next(pair, &pair1);
   }
   if (pair)
   {
@@ -1359,7 +1359,7 @@ parse_select (char *line)
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
             pair_t _pair;
-            for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+            for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
             {
               if (pair->key == fk->key)
               {
@@ -1420,7 +1420,7 @@ parse_select (char *line)
         for (field_t *field = query->fields; field; field = field->next)
         {
           pair_t _pair;
-          for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+          for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
           {
             for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
             {
@@ -1465,7 +1465,7 @@ parse_select (char *line)
         fields_release(query);
 
         pair_t _pair;
-        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
         {
           field_t *field  = field_create(query);
           if (!field) goto res_fail;
@@ -1482,7 +1482,7 @@ parse_select (char *line)
         field->prepare(query, field);
 
         pair_t _pair;
-        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
         {
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
@@ -1591,7 +1591,7 @@ parse_delete (char *line)
         record_t *next = record->link;
 
         pair_t _pair;
-        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
         {
           int kill = 1;
           if (query->fields)
@@ -1835,7 +1835,7 @@ consolidate ()
     {
       fprintf(activity, "1 %lu", record->id);
       pair_t _pair;
-      for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair))
+      for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
         fprintf(activity, " %lu %lu", pair->key, pair->val);
       fprintf(activity, "\n");
     }
