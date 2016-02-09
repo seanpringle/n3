@@ -354,7 +354,7 @@ pool_open (pool_t *pool, size_t size, size_t extent)
 
   snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
 
-  ensure((pool->data = fopen(scratch, "w+")))
+  ensure((pool->data = fopen(scratch, "w+b")))
     errorf("cannot create pool: %06lu.data", pool->size);
 
   while (pool->width * pool->size < (pool->extent*10) * pool->size)
@@ -390,18 +390,19 @@ pool_read (pool_t *pool, off_t item, void *ptr)
   if (cached)
   {
     memmove(ptr, cached, pool->size);
-    return;
   }
+  else
+  {
+    mutex_lock(&pool->data_mutex);
 
-  mutex_lock(&pool->data_mutex);
+    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+      errorf("cannot seek pool: %06lu.data", pool->size);
 
-  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data", pool->size);
+    ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
+      errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
 
-  ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
-    errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
-
-  mutex_unlock(&pool->data_mutex);
+    mutex_unlock(&pool->data_mutex);
+  }
   rwlock_unlock(&pool->rwlock);
 }
 
@@ -418,18 +419,19 @@ pool_write (pool_t *pool, off_t item, void *ptr)
   if (cached)
   {
     memmove(cached, ptr, pool->size);
-    return;
   }
+  else
+  {
+    mutex_lock(&pool->data_mutex);
 
-  mutex_lock(&pool->data_mutex);
+    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+      errorf("cannot seek pool: %06lu.data", pool->size);
 
-  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data", pool->size);
+    ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
+      errorf("cannot write pool: %06lu.head", pool->size);
 
-  ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
-    errorf("cannot write pool: %06lu.head", pool->size);
-
-  mutex_unlock(&pool->data_mutex);
+    mutex_unlock(&pool->data_mutex);
+  }
   rwlock_unlock(&pool->rwlock);
 }
 
@@ -468,7 +470,6 @@ pool_alloc (pool_t *pool)
   }
 
   pool->first = *((off_t*)ptr);
-  //pool_flush(pool);
   free(ptr);
 
   rwlock_unlock(&pool->rwlock);
@@ -492,7 +493,6 @@ pool_free (pool_t *pool, off_t item)
   {
     *((off_t*)ptr) = pool->first;
     pool->first = item;
-    //pool_flush(pool);
     memmove(cached, ptr, pool->size);
   }
   else
@@ -2103,7 +2103,7 @@ main (int argc, char *argv[])
   long page_size  = sysconf(_SC_PAGESIZE);
   long phys_pages = sysconf(_SC_PHYS_PAGES);
 
-  size_t pool_pair_extent = 10000;
+  size_t pool_pair_extent = 500000;
 
   if (page_size > 0 && phys_pages > 0)
   {
@@ -2113,7 +2113,7 @@ main (int argc, char *argv[])
     {
       store.width = PRIME_100000;
       dict.width  = PRIME_10000;
-      pool_pair_extent = 100000;
+      pool_pair_extent = 5000000;
     }
   }
 
