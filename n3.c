@@ -150,6 +150,7 @@ typedef struct {
 
 typedef struct _self_t {
   int response;
+  FILE *pool_data;
 } self_t;
 
 struct _field_t;
@@ -389,15 +390,26 @@ pool_read (pool_t *pool, off_t item, void *ptr)
   }
   else
   {
-    mutex_lock(&pool->data_mutex);
+    if (self->pool_data)
+    {
+      ensure(fseeko(self->pool_data, item * pool->size, SEEK_SET) == 0)
+        errorf("cannot seek pool: %06lu.data", pool->size);
 
-    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-      errorf("cannot seek pool: %06lu.data", pool->size);
+      ensure(fread(ptr, 1, pool->size, self->pool_data) == pool->size)
+        errorf("cannot read pool: %06lu.head", pool->size);
+    }
+    else
+    {
+      mutex_lock(&pool->data_mutex);
 
-    ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
-      errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
+      ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+        errorf("cannot seek pool: %06lu.data", pool->size);
 
-    mutex_unlock(&pool->data_mutex);
+      ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
+        errorf("cannot read pool: %06lu.head", pool->size);
+
+      mutex_unlock(&pool->data_mutex);
+    }
   }
 }
 
@@ -2005,9 +2017,18 @@ client (void *ptr)
   self_t _self;
   pthread_setspecific(keyself, &_self);
 
+  char *packet = allocate(state.max_packet);
   self->response = *((int*)ptr);
 
-  char *packet = allocate(state.max_packet);
+  char scratch[100];
+  snprintf(scratch, sizeof(scratch), "%06lu.data", pool_pair.size);
+  self->pool_data = fopen(scratch, "r");
+
+  if (!self->pool_data)
+  {
+    respondf("%u i/o\n", E_SERVER);
+    goto done;
+  }
 
   if (!packet)
   {
@@ -2037,10 +2058,12 @@ client (void *ptr)
     break;
   }
 
+  fclose(self->pool_data);
+
 done:
 
-  close(self->response);
   release(packet, state.max_packet);
+  close(self->response);
 
   *((int*)ptr) = -1;
 
@@ -2148,6 +2171,7 @@ main (int argc, char *argv[])
   char *packet = allocate(state.max_packet);
 
   self->response = 0;
+  self->pool_data = NULL;
   activity = NULL;
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
