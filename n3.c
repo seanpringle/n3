@@ -77,7 +77,7 @@ typedef int (*callback)(void*);
 #define PATH 256
 #define ALIAS 128
 #define POOL 100000
-#define POOL_CACHE 300000
+#define POOL_CACHE 1000000
 
 #define E_OK 0
 #define E_PARSE 1
@@ -143,9 +143,6 @@ typedef struct {
 } dict_t;
 
 typedef struct {
-  size_t mem_used;
-  size_t mem_limit;
-  counter_t mem_limit_hit;
   char sock_path[LINE];
   char data_path[LINE];
   size_t max_packet;
@@ -202,7 +199,6 @@ typedef struct _query_t {
 } query_t;
 
 pthread_rwlock_t rwlock;
-pthread_mutex_t state_mutex;
 pthread_mutex_t alias_mutex;
 pthread_mutex_t activity_mutex;
 static pthread_key_t keyself;
@@ -281,36 +277,13 @@ regex_t re_alias_get;
 void*
 allocate (size_t bytes)
 {
-  mutex_lock(&state_mutex);
-
-  if (state.mem_used + bytes >= state.mem_limit)
-  {
-    if (!state.mem_limit_hit)
-      errorf("hit state.mem_limit %lu", state.mem_limit);
-    state.mem_limit_hit++;
-    mutex_unlock(&state_mutex);
-    return NULL;
-  }
-
-  state.mem_used += bytes;
-  mutex_unlock(&state_mutex);
   return malloc(bytes);
 }
 
 void
 release (void *ptr, size_t bytes)
 {
-  if (ptr)
-  {
-    mutex_lock(&state_mutex);
-
-    ensure(state.mem_used >= bytes)
-      errorf("bad state.mem_used");
-
-    state.mem_used -= bytes;
-    mutex_unlock(&state_mutex);
-    free(ptr);
-  }
+  free(ptr);
 }
 
 void
@@ -1938,9 +1911,6 @@ status ()
 
   respondf("records %lu", records);
   respondf(" aliases %lu", aliases);
-  respondf(" mem_used %lu", state.mem_used);
-  respondf(" mem_limit %lu", state.mem_limit);
-  respondf(" mem_limit_hit %lu", state.mem_limit_hit);
   respondf(" max_packet %u", (uint32_t)state.max_packet);
   respondf(" path %s", state.data_path);
   respondf(" socket %s", state.sock_path);
@@ -2173,7 +2143,6 @@ main (int argc, char *argv[])
   store.width = PRIME_10000;
   dict.width  = PRIME_1000;
 
-  state.mem_limit   = 1024 * 1024 * 1024;
   state.max_packet  = 1024 * 1024 * 1;
   state.max_threads = 16;
 
@@ -2189,15 +2158,12 @@ main (int argc, char *argv[])
       store.width = PRIME_100000;
       dict.width  = PRIME_10000;
     }
-
-    state.mem_limit = total_mem * 0.75;
   }
 
   snprintf(state.sock_path, sizeof(state.sock_path), "/tmp/n3.sock");
   snprintf(state.data_path, sizeof(state.data_path), ".");
 
   pthread_rwlock_init(&rwlock, NULL);
-  pthread_mutex_init(&state_mutex, NULL);
   pthread_mutex_init(&alias_mutex, NULL);
   pthread_mutex_init(&activity_mutex, NULL);
   pthread_key_create(&keyself, NULL);
@@ -2223,11 +2189,6 @@ main (int argc, char *argv[])
     if (!strcmp("-socket", argv[i]))
     {
       snprintf(state.sock_path, sizeof(state.sock_path), "%s", argv[++i]);
-      continue;
-    }
-    if (!strcmp("-memory", argv[i]))
-    {
-      state.mem_limit = strtonum(argv[++i], NULL);
       continue;
     }
     if (!strcmp("-width", argv[i]))
