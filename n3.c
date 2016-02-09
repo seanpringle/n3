@@ -101,7 +101,6 @@ typedef struct _pool_t {
   FILE *data;
   byte_t *cache;
   size_t cached;
-  pthread_mutex_t pool_mutex;
   pthread_mutex_t data_mutex;
 } pool_t;
 
@@ -349,7 +348,6 @@ pool_open (pool_t *pool, size_t size, size_t extent)
   pool->size = size;
   pool->extent = extent;
 
-  pthread_mutex_init(&pool->pool_mutex, NULL);
   pthread_mutex_init(&pool->data_mutex, NULL);
 
   snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
@@ -380,8 +378,6 @@ pool_cached (pool_t *pool, off_t item)
 void
 pool_read (pool_t *pool, off_t item, void *ptr)
 {
-  mutex_lock(&pool->pool_mutex);
-
   ensure(item < pool->width && item > 0)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -403,14 +399,11 @@ pool_read (pool_t *pool, off_t item, void *ptr)
 
     mutex_unlock(&pool->data_mutex);
   }
-  mutex_unlock(&pool->pool_mutex);
 }
 
 void
 pool_write (pool_t *pool, off_t item, void *ptr)
 {
-  mutex_lock(&pool->pool_mutex);
-
   ensure(item < pool->width && item > 0)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -432,14 +425,11 @@ pool_write (pool_t *pool, off_t item, void *ptr)
 
     mutex_unlock(&pool->data_mutex);
   }
-  mutex_unlock(&pool->pool_mutex);
 }
 
 off_t
 pool_alloc (pool_t *pool)
 {
-  mutex_lock(&pool->pool_mutex);
-
   if (!pool->first)
   {
     pool_flush(pool);
@@ -472,15 +462,12 @@ pool_alloc (pool_t *pool)
   pool->first = *((off_t*)ptr);
   free(ptr);
 
-  mutex_unlock(&pool->pool_mutex);
   return item;
 }
 
 void
 pool_free (pool_t *pool, off_t item)
 {
-  mutex_lock(&pool->pool_mutex);
-
   ensure(item < pool->width && item > 0)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
@@ -507,7 +494,6 @@ pool_free (pool_t *pool, off_t item)
 
     mutex_unlock(&pool->data_mutex);
   }
-  mutex_unlock(&pool->pool_mutex);
   free(ptr);
 }
 
