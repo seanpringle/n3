@@ -94,12 +94,6 @@ typedef uint64_t number_t;
 typedef uint64_t counter_t;
 typedef uint8_t byte_t;
 
-typedef struct _pool_node_t {
-  void *ptr;
-  off_t offset;
-  struct _pool_node_t *next;
-} pool_node_t;
-
 typedef struct _pool_t {
   size_t size;
   size_t width;
@@ -158,14 +152,8 @@ typedef struct {
   size_t max_threads;
 } state_t;
 
-typedef struct _pool_cache_t {
-  pool_node_t *chains[PRIME_1000];
-  counter_t count;
-} pool_cache_t;
-
 typedef struct _self_t {
   int response;
-  pool_cache_t *pool_cache;
 } self_t;
 
 struct _field_t;
@@ -325,48 +313,6 @@ release (void *ptr, size_t bytes)
   }
 }
 
-pool_node_t*
-cache_lookup (off_t item)
-{
-  for (pool_node_t *node = self->pool_cache->chains[item % PRIME_1000]; node; node = node->next)
-  {
-    if (node->offset == item)
-      return node;
-  }
-  return NULL;
-}
-
-void
-cache_empty ()
-{
-  int count = 0;
-  for (int i = 0; i < PRIME_1000; i++)
-  {
-    for (pool_node_t *next = NULL, *node = self->pool_cache->chains[i]; node; node = next)
-    {
-      next = node->next;
-      release(node->ptr, sizeof(pair_t));
-      release(node, sizeof(pool_node_t));
-      count++;
-    }
-    self->pool_cache->chains[i] = NULL;
-  }
-  self->pool_cache->count = 0;
-  //errorf("cache_empty() %d", count);
-}
-
-void
-cache_insert (off_t item, void *ptr)
-{
-  pool_node_t *node = allocate(sizeof(pool_node_t));
-  node->offset = item;
-  node->next = self->pool_cache->chains[item % PRIME_1000];
-  self->pool_cache->chains[item % PRIME_1000] = node;
-  node->ptr = allocate(sizeof(pair_t));
-  memmove(node->ptr, ptr, sizeof(pair_t));
-  self->pool_cache->count++;
-}
-
 void
 pool_flush (pool_t *pool)
 {
@@ -454,7 +400,19 @@ pool_init (size_t size)
 }
 
 void
-pool_preload (pool_t *pool)
+pool_flush_cache (pool_t *pool)
+{
+  off_t offset = pool->width * pool->size - pool->cached;
+
+  ensure(fseeko(pool->data, offset, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data (offset %lu)", pool->size, offset);
+
+  ensure(fwrite(pool->cache, 1, pool->cached, pool->data) == pool->cached)
+    errorf("cannot read pool: %06lu.data", pool->size);
+}
+
+void
+pool_prime_cache (pool_t *pool)
 {
   off_t offset = pool->width * pool->size - pool->cached;
 
@@ -504,9 +462,7 @@ pool_open (pool_t *pool, size_t size)
     return 0;
   }
 
-  pool_preload(pool);
-
-  pthread_mutex_init(&pool->mutex, NULL);
+  pool_prime_cache(pool);
 
   return 1;
 }
@@ -560,12 +516,6 @@ pool_write_raw (pool_t *pool, off_t item, void *ptr)
   ensure(item > 0)
     errorf("attempt to access item 0 in pool: %06lu", pool->size);
 
-  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data", pool->size);
-
-  ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
-    errorf("cannot write pool: %06lu.head", pool->size);
-
   byte_t *cached = pool_offset_cached(pool, item);
 
   if (cached)
@@ -573,6 +523,12 @@ pool_write_raw (pool_t *pool, off_t item, void *ptr)
     memmove(cached, ptr, pool->size);
     return;
   }
+
+  ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+    errorf("cannot seek pool: %06lu.data", pool->size);
+
+  ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
+    errorf("cannot write pool: %06lu.head", pool->size);
 }
 
 void
@@ -590,8 +546,9 @@ pool_alloc (pool_t *pool)
 
   if (!pool->first)
   {
+    pool_flush_cache(pool);
     pool_extend(pool);
-    pool_preload(pool);
+    pool_prime_cache(pool);
   }
 
   void *ptr = malloc(pool->size);
@@ -1602,7 +1559,6 @@ parse_select (char *line)
       }
 
       query->handler(query);
-      cache_empty();
     }
   }
   else
@@ -1666,7 +1622,6 @@ parse_select (char *line)
       }
 
       query->handler(query);
-      cache_empty();
     }
   }
   else
@@ -1723,7 +1678,6 @@ parse_select (char *line)
         field->cleanup(query, field);
       }
       query->handler(query);
-      cache_empty();
     }
   }
 
@@ -1841,7 +1795,6 @@ parse_delete (char *line)
           deleted_records++;
         }
         record = next;
-        cache_empty();
       }
 
       if (deleted_records || deleted_pairs)
@@ -2161,7 +2114,6 @@ parse (char *line)
   {
     respondf("%u unknown: %s\n", E_PARSE, line);
   }
-  cache_empty();
 }
 
 void*
@@ -2171,7 +2123,6 @@ client (void *ptr)
   pthread_setspecific(keyself, &_self);
 
   self->response = *((int*)ptr);
-  self->pool_cache = calloc(1, sizeof(pool_cache_t));
 
   char *packet = allocate(state.max_packet);
 
@@ -2205,7 +2156,6 @@ client (void *ptr)
 
 done:
 
-  cache_empty();
   close(self->response);
   release(packet, state.max_packet);
 
@@ -2326,7 +2276,6 @@ main (int argc, char *argv[])
   char *packet = allocate(state.max_packet);
 
   self->response = 0;
-  self->pool_cache = calloc(PRIME_1000, sizeof(pool_cache_t));
   activity = NULL;
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
