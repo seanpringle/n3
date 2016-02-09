@@ -1943,15 +1943,15 @@ client (void *ptr)
 
   self->pool_data = fopen(pool_pair.name, "r");
 
-  if (!self->pool_data)
-  {
-    respondf("%u i/o\n", E_SERVER);
-    goto done;
-  }
-
   if (!packet)
   {
     respondf("%u oom\n", E_SERVER);
+    goto done;
+  }
+
+  if (!self->pool_data)
+  {
+    respondf("%u i/o\n", E_SERVER);
     goto done;
   }
 
