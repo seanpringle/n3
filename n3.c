@@ -327,21 +327,22 @@ pool_extent_flush (pool_t *pool)
 byte_t*
 pool_cached (pool_t *pool, off_t position)
 {
+  if (position < pool->extents[0]->offset)
+    return NULL;
+
+  extent_t *extent = NULL;
+
   for (int i = 0; i < POOL_EXTENTS; i++)
   {
-    extent_t *extent = pool->extents[i];
-
-    if (i == 0 && position < extent->offset)
-      return NULL;
-
+    extent = pool->extents[i];
     if (extent->offset + pool->extent_bytes > position)
-      return extent->data + (position - extent->offset);
+      break;
   }
 
-  ensure(0)
+  ensure(extent)
     errorf("attempt to access position beyond pool: %lu", position);
 
-  return NULL;
+  return extent->data + (position - extent->offset);
 }
 
 void
@@ -364,14 +365,15 @@ pool_open (pool_t *pool, size_t size, size_t extent, char *name)
   }
 }
 
-void
+void*
 pool_read (pool_t *pool, off_t position, void *ptr)
 {
   byte_t *cached = pool_cached(pool, position);
 
   if (cached)
   {
-    memmove(ptr, cached, pool->size);
+    //memmove(ptr, cached, pool->size);
+    return cached;
   }
   else
   {
@@ -380,6 +382,7 @@ pool_read (pool_t *pool, off_t position, void *ptr)
 
     ensure(fread(ptr, 1, pool->size, self->pool_data) == pool->size)
       errorf("cannot read pool: %s", pool->name);
+    return ptr;
   }
 }
 
@@ -544,8 +547,7 @@ pair_first (record_t *record, pair_t *pair)
 {
   if (record->pairs)
   {
-    pool_read(&pool_pair, record->pairs, pair);
-    return pair;
+    return pool_read(&pool_pair, record->pairs, pair);
   }
   return NULL;
 }
@@ -555,8 +557,7 @@ pair_next (pair_t *pair)
 {
   if (pair && pair->sibling)
   {
-    pool_read(&pool_pair, pair->sibling, pair);
-    return pair;
+    return pool_read(&pool_pair, pair->sibling, pair);
   }
   return NULL;
 }
