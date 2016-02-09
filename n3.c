@@ -76,8 +76,7 @@ typedef int (*callback)(void*);
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
-#define POOL 100000
-#define POOL_CACHE 1000000
+#define POOL 1000000
 
 #define E_OK 0
 #define E_PARSE 1
@@ -95,10 +94,10 @@ typedef uint64_t counter_t;
 typedef uint8_t byte_t;
 
 typedef struct _pool_t {
+  size_t extent;
   size_t size;
   size_t width;
   off_t first;
-  FILE *head;
   FILE *data;
   byte_t *cache;
   size_t cached;
@@ -288,33 +287,15 @@ release (void *ptr, size_t bytes)
 }
 
 void
-pool_flush (pool_t *pool)
-{
-  pool_persist_t tmp;
-
-  tmp.size  = pool->size;
-  tmp.width = pool->width;
-  tmp.first = pool->first;
-
-  ensure(fseeko(pool->head, 0, SEEK_SET) == 0)
-    errorf("cannot seek %06lu.head", pool->size);
-
-  ensure(fwrite(&tmp, 1, sizeof(pool_persist_t), pool->head) == sizeof(pool_persist_t))
-    errorf("cannot write %06lu.head", pool->size);
-}
-
-void
 pool_extend (pool_t *pool)
 {
-  errorf("extending pool: %06lu", pool->size);
-
-  int bytes = pool->size * POOL;
+  int bytes = pool->size * pool->extent;
   unsigned char *chunk = allocate(bytes);
   memset(chunk, 0, bytes);
 
   unsigned char *p = chunk;
 
-  for (int i = 0; i < POOL; i++)
+  for (int i = 0; i < pool->extent; i++)
   {
     *((off_t*)p) = pool->width + i + 1;
     p += pool->size;
@@ -331,50 +312,12 @@ pool_extend (pool_t *pool)
   ensure(fwrite(chunk, 1, bytes, pool->data) == bytes)
     errorf("cannot extend pool: %06lu", pool->size);
 
-  pool->width += POOL;
+  pool->width += pool->extent;
   release(chunk, bytes);
 }
 
 void
-pool_init (size_t size)
-{
-  char scratch[100];
-
-  pool_t *pool = allocate(sizeof(pool_t));
-
-  pool->size  = size;
-  pool->width = 0;
-  pool->first = 0;
-  pool->head  = NULL;
-  pool->data  = NULL;
-
-  errorf("initializing pool: %06lu", pool->size);
-
-  snprintf(scratch, sizeof(scratch), "%06lu.head", pool->size);
-
-  ensure((pool->head = fopen(scratch, "w")))
-    errorf("cannot create pool: %06lu.head", pool->size);
-
-  snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
-
-  ensure((pool->data = fopen(scratch, "w")))
-    errorf("cannot create pool: %06lu.data", pool->size);
-
-  while (pool->width * pool->size < POOL_CACHE * pool->size)
-    pool_extend(pool);
-
-  pool->first = 1;
-
-  pool_flush(pool);
-
-  fclose(pool->head);
-  fclose(pool->data);
-
-  release(pool, sizeof(pool_t));
-}
-
-void
-pool_flush_cache (pool_t *pool)
+pool_flush (pool_t *pool)
 {
   off_t offset = pool->width * pool->size - pool->cached;
 
@@ -382,11 +325,11 @@ pool_flush_cache (pool_t *pool)
     errorf("cannot seek pool: %06lu.data (offset %lu)", pool->size, offset);
 
   ensure(fwrite(pool->cache, 1, pool->cached, pool->data) == pool->cached)
-    errorf("cannot read pool: %06lu.data", pool->size);
+    errorf("cannot write pool: %06lu.data", pool->size);
 }
 
 void
-pool_prime_cache (pool_t *pool)
+pool_prime (pool_t *pool)
 {
   off_t offset = pool->width * pool->size - pool->cached;
 
@@ -397,51 +340,33 @@ pool_prime_cache (pool_t *pool)
     errorf("cannot read pool: %06lu.data", pool->size);
 }
 
-int
-pool_open (pool_t *pool, size_t size)
+void
+pool_open (pool_t *pool, size_t size, size_t extent)
 {
   char scratch[100];
 
   memset(pool, 0, sizeof(pool_t));
+  pool->size = size;
+  pool->extent = extent;
+
   pthread_rwlock_init(&pool->rwlock, NULL);
   pthread_mutex_init(&pool->data_mutex, NULL);
 
-  pool->size = size;
-
-  snprintf(scratch, sizeof(scratch), "%06lu.head", pool->size);
-
-  if (!(pool->head = fopen(scratch, "r+")))
-  {
-    errorf("cannot open pool: %06lu.head", pool->size);
-    return 0;
-  }
-
   snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
 
-  if (!(pool->data = fopen(scratch, "r+")))
-  {
-    errorf("cannot open pool: %06lu.data", pool->size);
-    return 0;
-  }
+  ensure((pool->data = fopen(scratch, "w+")))
+    errorf("cannot create pool: %06lu.data", pool->size);
 
-  pool_persist_t tmp;
+  while (pool->width * pool->size < (pool->extent*10) * pool->size)
+    pool_extend(pool);
 
-  ensure(fread(&tmp, 1, sizeof(pool_persist_t), pool->head) == sizeof(pool_persist_t))
-    errorf("cannot read pool: %06lu.head", pool->size);
-
-  pool->width = tmp.width;
-  pool->first = tmp.first;
-  pool->cached = POOL_CACHE * pool->size;
+  pool->first = 1;
+  pool->cached = (pool->extent*10) * pool->size;
 
   ensure((pool->cache = allocate(pool->cached)) && pool->cache)
-  {
     errorf("cannot allocate pool memory: %06lu (%lu bytes)", pool->size, pool->cached);
-    return 0;
-  }
 
-  pool_prime_cache(pool);
-
-  return 1;
+  pool_prime(pool);
 }
 
 byte_t*
@@ -515,9 +440,9 @@ pool_alloc (pool_t *pool)
 
   if (!pool->first)
   {
-    pool_flush_cache(pool);
+    pool_flush(pool);
     pool_extend(pool);
-    pool_prime_cache(pool);
+    pool_prime(pool);
   }
 
   void *ptr = malloc(pool->size);
@@ -2178,6 +2103,8 @@ main (int argc, char *argv[])
   long page_size  = sysconf(_SC_PAGESIZE);
   long phys_pages = sysconf(_SC_PHYS_PAGES);
 
+  size_t pool_pair_extent = 10000;
+
   if (page_size > 0 && phys_pages > 0)
   {
     number_t total_mem = (number_t)phys_pages * (number_t)page_size;
@@ -2186,6 +2113,7 @@ main (int argc, char *argv[])
     {
       store.width = PRIME_100000;
       dict.width  = PRIME_10000;
+      pool_pair_extent = 100000;
     }
   }
 
@@ -2201,12 +2129,7 @@ main (int argc, char *argv[])
   pthread_setspecific(keyself, &_self);
   signal(SIGPIPE, SIG_IGN);
 
-//  if (!pool_open(&pool_pair, sizeof(pair_t)))
-//  {
-    pool_init(sizeof(pair_t));
-    ensure(pool_open(&pool_pair, sizeof(pair_t)))
-      errorf("unable to open pair_t pool");
-//  }
+  pool_open(&pool_pair, sizeof(pair_t), pool_pair_extent);
 
   for (int i = 1; i < argc; i++)
   {
