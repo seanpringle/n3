@@ -102,7 +102,8 @@ typedef struct _pool_t {
   FILE *data;
   byte_t *cache;
   size_t cached;
-  pthread_mutex_t mutex;
+  pthread_rwlock_t rwlock;
+  pthread_mutex_t data_mutex;
 } pool_t;
 
 typedef struct _pool_persist_t {
@@ -402,6 +403,9 @@ pool_open (pool_t *pool, size_t size)
   char scratch[100];
 
   memset(pool, 0, sizeof(pool_t));
+  pthread_rwlock_init(&pool->rwlock, NULL);
+  pthread_mutex_init(&pool->data_mutex, NULL);
+
   pool->size = size;
 
   snprintf(scratch, sizeof(scratch), "%06lu.head", pool->size);
@@ -449,13 +453,12 @@ pool_offset_cached (pool_t *pool, off_t item)
 }
 
 void
-pool_read_raw (pool_t *pool, off_t item, void *ptr)
+pool_read (pool_t *pool, off_t item, void *ptr)
 {
-  ensure(item < pool->width)
-    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+  rwlock_rdlock(&pool->rwlock);
 
-  ensure(item > 0)
-    errorf("attempt to access item 0 in pool: %06lu", pool->size);
+  ensure(item < pool->width && item > 0)
+    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
   byte_t *cached = pool_offset_cached(pool, item);
 
@@ -465,29 +468,25 @@ pool_read_raw (pool_t *pool, off_t item, void *ptr)
     return;
   }
 
+  mutex_lock(&pool->data_mutex);
+
   ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
     errorf("cannot seek pool: %06lu.data", pool->size);
 
   ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
     errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
+
+  mutex_unlock(&pool->data_mutex);
+  rwlock_unlock(&pool->rwlock);
 }
 
 void
-pool_read (pool_t *pool, off_t item, void *ptr)
+pool_write (pool_t *pool, off_t item, void *ptr)
 {
-  mutex_lock(&pool->mutex);
-  pool_read_raw(pool, item, ptr);
-  mutex_unlock(&pool->mutex);
-}
+  rwlock_wrlock(&pool->rwlock);
 
-void
-pool_write_raw (pool_t *pool, off_t item, void *ptr)
-{
-  ensure(item < pool->width)
+  ensure(item < pool->width && item > 0)
     errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
-
-  ensure(item > 0)
-    errorf("attempt to access item 0 in pool: %06lu", pool->size);
 
   byte_t *cached = pool_offset_cached(pool, item);
 
@@ -497,25 +496,22 @@ pool_write_raw (pool_t *pool, off_t item, void *ptr)
     return;
   }
 
+  mutex_lock(&pool->data_mutex);
+
   ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
     errorf("cannot seek pool: %06lu.data", pool->size);
 
   ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
     errorf("cannot write pool: %06lu.head", pool->size);
-}
 
-void
-pool_write (pool_t *pool, off_t item, void *ptr)
-{
-  mutex_lock(&pool->mutex);
-  pool_write_raw(pool, item, ptr);
-  mutex_unlock(&pool->mutex);
+  mutex_unlock(&pool->data_mutex);
+  rwlock_unlock(&pool->rwlock);
 }
 
 off_t
 pool_alloc (pool_t *pool)
 {
-  mutex_lock(&pool->mutex);
+  rwlock_wrlock(&pool->rwlock);
 
   if (!pool->first)
   {
@@ -527,37 +523,67 @@ pool_alloc (pool_t *pool)
   void *ptr = malloc(pool->size);
   off_t item = pool->first;
 
-  pool_read_raw(pool, item, ptr);
+  byte_t *cached = pool_offset_cached(pool, item);
+
+  if (cached)
+  {
+    memmove(ptr, cached, pool->size);
+  }
+  else
+  {
+    mutex_lock(&pool->data_mutex);
+
+    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+      errorf("cannot seek pool: %06lu.data", pool->size);
+
+    ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
+      errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
+
+    mutex_unlock(&pool->data_mutex);
+  }
 
   pool->first = *((off_t*)ptr);
   //pool_flush(pool);
   free(ptr);
 
-  mutex_unlock(&pool->mutex);
+  rwlock_unlock(&pool->rwlock);
   return item;
 }
 
 void
 pool_free (pool_t *pool, off_t item)
 {
-  ensure(item < pool->width)
-    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+  rwlock_wrlock(&pool->rwlock);
 
-  ensure(item > 0)
-    errorf("attempt to access item 0 in pool: %06lu", pool->size);
+  ensure(item < pool->width && item > 0)
+    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
   void *ptr = malloc(pool->size);
   memset(ptr, 0, pool->size);
 
-  *((off_t*)ptr) = pool->first;
-  pool->first = item;
+  byte_t *cached = pool_offset_cached(pool, item);
 
-  //pool_flush(pool);
-  pool_write_raw(pool, item, ptr);
+  if (cached)
+  {
+    *((off_t*)ptr) = pool->first;
+    pool->first = item;
+    //pool_flush(pool);
+    memmove(cached, ptr, pool->size);
+  }
+  else
+  {
+    mutex_lock(&pool->data_mutex);
 
+    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
+      errorf("cannot seek pool: %06lu.data", pool->size);
+
+    ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
+      errorf("cannot write pool: %06lu.head", pool->size);
+
+    mutex_unlock(&pool->data_mutex);
+  }
+  rwlock_unlock(&pool->rwlock);
   free(ptr);
-
-  mutex_unlock(&pool->mutex);
 }
 
 int
@@ -1999,6 +2025,8 @@ consolidate ()
   }
   fflush(activity);
 
+  mutex_lock(&alias_mutex);
+
   snprintf(scratch, sizeof(scratch), "%s/aliases", state.data_path);
   FILE *aliases = fopen(scratch, "w");
 
@@ -2017,6 +2045,7 @@ consolidate ()
   fclose(aliases);
 
 done:
+  mutex_unlock(&alias_mutex);
   mutex_unlock(&activity_mutex);
   respondf("%u\n", rc);
 }
