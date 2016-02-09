@@ -76,7 +76,7 @@ typedef int (*callback)(void*);
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
-#define POOL 1000000
+#define POOL_EXTENTS 3
 
 #define E_OK 0
 #define E_PARSE 1
@@ -93,22 +93,23 @@ typedef uint64_t number_t;
 typedef uint64_t counter_t;
 typedef uint8_t byte_t;
 
-typedef struct _pool_t {
-  size_t extent;
-  size_t size;
-  size_t width;
+typedef struct _extent_t {
+  off_t offset;
+  byte_t* data;
   off_t first;
-  FILE *data;
-  byte_t *cache;
-  size_t cached;
-  pthread_mutex_t data_mutex;
-} pool_t;
+  struct _extent_t *next;
+} extent_t;
 
-typedef struct _pool_persist_t {
+typedef struct _pool_t {
+  size_t extent_size;
+  size_t extent_count;
+  extent_t *extents[POOL_EXTENTS];
+  size_t extent_bytes;
   size_t size;
-  size_t width;
-  off_t first;
-} pool_persist_t;
+  FILE *data;
+  size_t data_bytes;
+  char *name;
+} pool_t;
 
 typedef struct _pair_t {
   off_t offset;
@@ -287,102 +288,86 @@ release (void *ptr, size_t bytes)
 }
 
 void
-pool_extend (pool_t *pool)
+pool_extent_create (pool_t *pool)
 {
-  int bytes = pool->size * pool->extent;
-  unsigned char *chunk = allocate(bytes);
-  memset(chunk, 0, bytes);
+  extent_t *extent = allocate(sizeof(extent_t));
+  extent->data = allocate(pool->extent_bytes);
 
-  unsigned char *p = chunk;
+  for (int i = 0; i < POOL_EXTENTS-1; i++)
+    pool->extents[i] = pool->extents[i+1];
 
-  for (int i = 0; i < pool->extent; i++)
-  {
-    *((off_t*)p) = pool->width + i + 1;
-    p += pool->size;
-  }
+  pool->extents[POOL_EXTENTS-1] = extent;
 
-  p -= pool->size;
-  *((off_t*)p) = 0;
+  extent->offset = pool->extent_count * pool->extent_bytes;
+  extent->first = extent->offset;
+  pool->extent_count++;
 
-  pool->first = pool->width;
-
-  ensure(fseeko(pool->data, pool->width * pool->size, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data", pool->size);
-
-  ensure(fwrite(chunk, 1, bytes, pool->data) == bytes)
-    errorf("cannot extend pool: %06lu", pool->size);
-
-  pool->width += pool->extent;
-  release(chunk, bytes);
+  errorf("create extent %lu", extent->offset);
 }
 
 void
-pool_flush (pool_t *pool)
+pool_extent_flush (pool_t *pool)
 {
-  off_t offset = pool->width * pool->size - pool->cached;
+  extent_t *extent = pool->extents[0];
 
-  ensure(fseeko(pool->data, offset, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data (offset %lu)", pool->size, offset);
+  ensure(fseeko(pool->data, extent->offset, SEEK_SET) == 0)
+    errorf("cannot seek pool: %s", pool->name);
 
-  ensure(fwrite(pool->cache, 1, pool->cached, pool->data) == pool->cached)
-    errorf("cannot write pool: %06lu.data", pool->size);
-}
+  ensure(fwrite(extent->data, 1, pool->extent_bytes, pool->data) == pool->extent_bytes)
+    errorf("cannot read pool: %s", pool->name);
 
-void
-pool_prime (pool_t *pool)
-{
-  off_t offset = pool->width * pool->size - pool->cached;
+  pool->data_bytes += pool->extent_bytes;
 
-  ensure(fseeko(pool->data, offset, SEEK_SET) == 0)
-    errorf("cannot seek pool: %06lu.data (offset %lu)", pool->size, offset);
+  release(extent->data, pool->size * pool->extent_size);
+  release(extent, sizeof(extent_t));
 
-  ensure(fread(pool->cache, 1, pool->cached, pool->data) == pool->cached)
-    errorf("cannot read pool: %06lu.data", pool->size);
-}
-
-void
-pool_open (pool_t *pool, size_t size, size_t extent)
-{
-  char scratch[100];
-
-  memset(pool, 0, sizeof(pool_t));
-  pool->size = size;
-  pool->extent = extent;
-
-  pthread_mutex_init(&pool->data_mutex, NULL);
-
-  snprintf(scratch, sizeof(scratch), "%06lu.data", pool->size);
-
-  ensure((pool->data = fopen(scratch, "w+b")))
-    errorf("cannot create pool: %06lu.data", pool->size);
-
-  while (pool->width * pool->size < (pool->extent*10) * pool->size)
-    pool_extend(pool);
-
-  pool->first = 1;
-  pool->cached = (pool->extent*10) * pool->size;
-
-  ensure((pool->cache = allocate(pool->cached)) && pool->cache)
-    errorf("cannot allocate pool memory: %06lu (%lu bytes)", pool->size, pool->cached);
-
-  pool_prime(pool);
+  pool_extent_create(pool);
 }
 
 byte_t*
-pool_cached (pool_t *pool, off_t item)
+pool_cached (pool_t *pool, off_t position)
 {
-  off_t item_offset  = item * pool->size;
-  off_t cache_offset = pool->width * pool->size - pool->cached;
-  return (item_offset > cache_offset) ? pool->cache + (item_offset - cache_offset): NULL;
+  for (int i = 0; i < POOL_EXTENTS; i++)
+  {
+    extent_t *extent = pool->extents[i];
+
+    if (i == 0 && position < extent->offset)
+      return NULL;
+
+    if (extent->offset + pool->extent_bytes > position)
+      return extent->data + (position - extent->offset);
+  }
+
+  ensure(0)
+    errorf("attempt to access position beyond pool: %lu", position);
+
+  return NULL;
 }
 
 void
-pool_read (pool_t *pool, off_t item, void *ptr)
+pool_open (pool_t *pool, size_t size, size_t extent, char *name)
 {
-  ensure(item < pool->width && item > 0)
-    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
+  memset(pool, 0, sizeof(pool_t));
+  pool->size = size;
+  pool->extent_size = extent;
+  pool->name = strdup(name);
 
-  byte_t *cached = pool_cached(pool, item);
+  pool->extent_count = 0;
+  pool->extent_bytes = size * extent;
+
+  ensure((pool->data = fopen(pool->name, "w")))
+    errorf("cannot create pool: %s", pool->name);
+
+  for (int i = 0; i < POOL_EXTENTS; i++)
+  {
+    pool_extent_create(pool);
+  }
+}
+
+void
+pool_read (pool_t *pool, off_t position, void *ptr)
+{
+  byte_t *cached = pool_cached(pool, position);
 
   if (cached)
   {
@@ -390,36 +375,18 @@ pool_read (pool_t *pool, off_t item, void *ptr)
   }
   else
   {
-    if (self->pool_data)
-    {
-      ensure(fseeko(self->pool_data, item * pool->size, SEEK_SET) == 0)
-        errorf("cannot seek pool: %06lu.data", pool->size);
+    ensure(fseeko(self->pool_data, position, SEEK_SET) == 0)
+      errorf("cannot seek pool: %s", pool->name);
 
-      ensure(fread(ptr, 1, pool->size, self->pool_data) == pool->size)
-        errorf("cannot read pool: %06lu.head", pool->size);
-    }
-    else
-    {
-      mutex_lock(&pool->data_mutex);
-
-      ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-        errorf("cannot seek pool: %06lu.data", pool->size);
-
-      ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
-        errorf("cannot read pool: %06lu.head", pool->size);
-
-      mutex_unlock(&pool->data_mutex);
-    }
+    ensure(fread(ptr, 1, pool->size, self->pool_data) == pool->size)
+      errorf("cannot read pool: %s", pool->name);
   }
 }
 
 void
-pool_write (pool_t *pool, off_t item, void *ptr)
+pool_write (pool_t *pool, off_t position, void *ptr)
 {
-  ensure(item < pool->width && item > 0)
-    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
-
-  byte_t *cached = pool_cached(pool, item);
+  byte_t *cached = pool_cached(pool, position);
 
   if (cached)
   {
@@ -427,86 +394,40 @@ pool_write (pool_t *pool, off_t item, void *ptr)
   }
   else
   {
-    mutex_lock(&pool->data_mutex);
-
-    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-      errorf("cannot seek pool: %06lu.data", pool->size);
+    ensure(fseeko(pool->data, position, SEEK_SET) == 0)
+      errorf("cannot seek pool: %s", pool->name);
 
     ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
-      errorf("cannot write pool: %06lu.head", pool->size);
-
-    mutex_unlock(&pool->data_mutex);
+      errorf("cannot write pool: %s", pool->name);
   }
 }
 
 off_t
 pool_alloc (pool_t *pool)
 {
-  if (!pool->first)
+  for (;;)
   {
-    pool_flush(pool);
-    pool_extend(pool);
-    pool_prime(pool);
+    for (int i = 0; i < POOL_EXTENTS; i++)
+    {
+      extent_t *extent = pool->extents[i];
+
+      if (extent->first < extent->offset + pool->extent_bytes)
+      {
+        off_t position = extent->first;
+        extent->first += pool->size;
+        return position;
+      }
+    }
+
+    pool_extent_flush(pool);
+    pool_extent_create(pool);
   }
-
-  void *ptr = malloc(pool->size);
-  off_t item = pool->first;
-
-  byte_t *cached = pool_cached(pool, item);
-
-  if (cached)
-  {
-    memmove(ptr, cached, pool->size);
-  }
-  else
-  {
-    mutex_lock(&pool->data_mutex);
-
-    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-      errorf("cannot seek pool: %06lu.data", pool->size);
-
-    ensure(fread(ptr, 1, pool->size, pool->data) == pool->size)
-      errorf("cannot read pool: %06lu.head, ferror: %d, feof: %d", pool->size, ferror(pool->data), feof(pool->data));
-
-    mutex_unlock(&pool->data_mutex);
-  }
-
-  pool->first = *((off_t*)ptr);
-  free(ptr);
-
-  return item;
 }
 
 void
-pool_free (pool_t *pool, off_t item)
+pool_free (pool_t *pool, off_t position)
 {
-  ensure(item < pool->width && item > 0)
-    errorf("attempt to access item %lu outside pool: %06lu", item, pool->size);
 
-  void *ptr = malloc(pool->size);
-  memset(ptr, 0, pool->size);
-
-  byte_t *cached = pool_cached(pool, item);
-
-  if (cached)
-  {
-    *((off_t*)ptr) = pool->first;
-    pool->first = item;
-    memmove(cached, ptr, pool->size);
-  }
-  else
-  {
-    mutex_lock(&pool->data_mutex);
-
-    ensure(fseeko(pool->data, item * pool->size, SEEK_SET) == 0)
-      errorf("cannot seek pool: %06lu.data", pool->size);
-
-    ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
-      errorf("cannot write pool: %06lu.head", pool->size);
-
-    mutex_unlock(&pool->data_mutex);
-  }
-  free(ptr);
 }
 
 int
@@ -1884,7 +1805,6 @@ status ()
   respondf(" alias_chains_max %lu", chains_max);
 
   respondf(" pool_size %lu", pool_pair.size);
-  respondf(" pool_width %lu", pool_pair.width);
   respondf("\n");
 }
 
@@ -2020,9 +1940,7 @@ client (void *ptr)
   char *packet = allocate(state.max_packet);
   self->response = *((int*)ptr);
 
-  char scratch[100];
-  snprintf(scratch, sizeof(scratch), "%06lu.data", pool_pair.size);
-  self->pool_data = fopen(scratch, "r");
+  self->pool_data = fopen(pool_pair.name, "r");
 
   if (!self->pool_data)
   {
@@ -2085,7 +2003,7 @@ main (int argc, char *argv[])
   long page_size  = sysconf(_SC_PAGESIZE);
   long phys_pages = sysconf(_SC_PHYS_PAGES);
 
-  size_t pool_pair_extent = 500000;
+  size_t pool_pair_extent = 1000000;
 
   if (page_size > 0 && phys_pages > 0)
   {
@@ -2095,7 +2013,7 @@ main (int argc, char *argv[])
     {
       store.width = PRIME_100000;
       dict.width  = PRIME_10000;
-      pool_pair_extent = 5000000;
+      pool_pair_extent = 10000000;
     }
   }
 
@@ -2111,7 +2029,7 @@ main (int argc, char *argv[])
   pthread_setspecific(keyself, &_self);
   signal(SIGPIPE, SIG_IGN);
 
-  pool_open(&pool_pair, sizeof(pair_t), pool_pair_extent);
+  pool_open(&pool_pair, sizeof(pair_t), pool_pair_extent, "pool");
 
   for (int i = 1; i < argc; i++)
   {
@@ -2171,7 +2089,7 @@ main (int argc, char *argv[])
   char *packet = allocate(state.max_packet);
 
   self->response = 0;
-  self->pool_data = NULL;
+  self->pool_data = fopen(pool_pair.name, "r");
   activity = NULL;
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
