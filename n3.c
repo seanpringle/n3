@@ -193,6 +193,7 @@ typedef struct _query_t {
   number_t low;
   number_t high;
   number_t step;
+  number_t limit;
   int count;
   int filled;
   int all_fields;
@@ -274,6 +275,9 @@ regex_t re_alias_set;
 
 regex_t re_alias_get;
 #define RE_ALIAS_GET "^" RE_NAME
+
+regex_t re_limit;
+#define RE_LIMIT "^limit " RE_NUMBER
 
 void*
 allocate (size_t bytes)
@@ -1584,9 +1588,20 @@ parse_delete (char *line)
       if (*line && !isspace(*line))
         goto syn_fail;
 
+      line = strskip(line, isspace);
+
+      if (regmatch(&re_limit, line))
+      {
+        line += 6;
+
+        if (!parse_number(&line, &query->limit, NULL))
+          goto num_fail;
+      }
+
       record_t *record = record_get_within(query->low, query->high);
 
-      while (record && record->id >= query->low && record->id <= query->high)
+      while (record && record->id >= query->low && record->id <= query->high
+        && (!query->limit || (query->limit && (deleted_records >= query->limit || deleted_pairs >= query->limit))))
       {
         record_t *next = record->link;
 
@@ -1622,7 +1637,7 @@ parse_delete (char *line)
         for (field_t *field = query->fields; field; field = field->next)
           length += sprintf(scratch + length, " %lu", field->fkeys->key);
 
-        activityf("2%s %lu:%lu", scratch, query->low, query->high);
+        activityf("2%s %lu:%lu limit %lu", scratch, query->low, query->high, query->limit);
       }
       break;
     }
@@ -1647,6 +1662,10 @@ id_fail:
 
 key_fail:
   respondf("%u expected key at: %s\n", E_PARSE, line);
+  goto done;
+
+num_fail:
+  respondf("%u expected number at: %s\n", E_PARSE, line);
   goto done;
 
 done:
@@ -2087,6 +2106,9 @@ main (int argc, char *argv[])
   ensure(regcomp(&re_alias_get, RE_ALIAS_GET, REG_EXTENDED|REG_NOSUB) == 0)
     errorf("regcomp failed: %s", RE_ALIAS_GET);
 
+  ensure(regcomp(&re_limit, RE_ALIAS_GET, REG_EXTENDED|REG_NOSUB) == 0)
+    errorf("regcomp failed: %s", RE_LIMIT);
+
   char *packet = allocate(state.max_packet);
 
   self->response = 0;
@@ -2204,6 +2226,7 @@ main (int argc, char *argv[])
   regfree(&re_field_as);
   regfree(&re_alias_set);
   regfree(&re_alias_get);
+  regfree(&re_limit);
 
   unlink(state.sock_path);
 
