@@ -578,7 +578,7 @@ parse_insert (char *line)
 
     if (!parse_number(&line, &key, NULL) || !parse_number(&line, &val, NULL))
     {
-      respondf("%u expected key and val: %s\n", E_PARSE, line);
+      respondf("%u expected key and val (%lu): %s\n", E_PARSE, id, line);
       return;
     }
 
