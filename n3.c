@@ -1494,7 +1494,7 @@ done:
 }
 
 void
-status ()
+show_status ()
 {
   number_t records = 0, aliases = 0;
 
@@ -1539,6 +1539,10 @@ status ()
   respondf(" record_chains_max %lu", chains_max);
 
   respondf(" pool_size %lu", pool_pair.size);
+  respondf(" pool_data_bytes %lu", pool_pair.data_bytes);
+  respondf(" pool_extent_size %lu", pool_pair.extent_size);
+  respondf(" pool_extent_count %lu", pool_pair.extent_count);
+  respondf(" pool_extent_bytes %lu", pool_pair.extent_bytes);
   respondf("\n");
 }
 
@@ -1650,7 +1654,7 @@ parse (char *line)
   else
   if (!strcmp("status", line))
   {
-    status();
+    show_status();
   }
   else
   if (!strcmp("consolidate", line))
