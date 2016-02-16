@@ -1,0 +1,3 @@
+[submodule "toolbelt"]
+	path = toolbelt
+	url = git@github.com:seanpringle/toolbelt.git

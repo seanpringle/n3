@@ -24,7 +24,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 */
 
-#define _GNU_SOURCE
+#include "toolbelt/toolbelt.c"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -44,11 +44,6 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <time.h>
 #include <pthread.h>
 
-#define PRIME_1000 997
-#define PRIME_10000 9973
-#define PRIME_100000 99991
-#define PRIME_1000000 999983
-
 void
 abort ()
 {
@@ -56,6 +51,7 @@ abort ()
   exit(EXIT_FAILURE);
 }
 
+#undef ensure
 #define ensure(x) for ( ; !(x) ; abort() )
 
 void
@@ -68,10 +64,8 @@ errortime ()
   fwrite(buf, 1, len, stderr);
 }
 
-//#define errorf(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while(0)
+#undef errorf
 #define errorf(...) do { errortime(); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while(0)
-
-typedef int (*callback)(void*);
 
 #define LINE 1024
 #define PATH 256
@@ -88,28 +82,8 @@ typedef int (*callback)(void*);
 #define O_DELETE 2
 #define O_SELECT 3
 
-typedef int (*delimiter)(int);
 typedef uint64_t number_t;
 typedef uint64_t counter_t;
-typedef uint8_t byte_t;
-
-typedef struct _extent_t {
-  off_t offset;
-  byte_t* data;
-  off_t first;
-  struct _extent_t *next;
-} extent_t;
-
-typedef struct _pool_t {
-  size_t extent_size;
-  size_t extent_count;
-  extent_t *extents[POOL_EXTENTS];
-  size_t extent_bytes;
-  size_t size;
-  FILE *data;
-  size_t data_bytes;
-  char *name;
-} pool_t;
 
 typedef struct _pair_t {
   off_t offset;
@@ -134,13 +108,7 @@ typedef struct {
 typedef struct _alias_t {
   char *str;
   number_t num;
-  struct _alias_t *next;
 } alias_t;
-
-typedef struct {
-  size_t width;
-  alias_t **chains;
-} dict_t;
 
 typedef struct {
   char sock_path[LINE];
@@ -209,7 +177,7 @@ static pthread_key_t keyself;
 FILE *activity;
 store_t store;
 state_t state;
-dict_t dict;
+dict_t *dict;
 int multithreaded;
 
 void
@@ -279,200 +247,6 @@ regex_t re_alias_get;
 regex_t re_limit;
 #define RE_LIMIT "^limit " RE_NUMBER
 
-void*
-allocate (size_t bytes)
-{
-  return malloc(bytes);
-}
-
-void
-release (void *ptr, size_t bytes)
-{
-  free(ptr);
-}
-
-void
-pool_extent_create (pool_t *pool)
-{
-  extent_t *extent = allocate(sizeof(extent_t));
-  extent->data = allocate(pool->extent_bytes);
-
-  for (int i = 0; i < POOL_EXTENTS-1; i++)
-    pool->extents[i] = pool->extents[i+1];
-
-  pool->extents[POOL_EXTENTS-1] = extent;
-
-  extent->offset = pool->extent_count * pool->extent_bytes;
-  extent->first = extent->offset;
-  pool->extent_count++;
-
-  errorf("create extent %lu", extent->offset);
-}
-
-void
-pool_extent_flush (pool_t *pool)
-{
-  extent_t *extent = pool->extents[0];
-
-  ensure(fseeko(pool->data, extent->offset, SEEK_SET) == 0)
-    errorf("cannot seek pool: %s", pool->name);
-
-  ensure(fwrite(extent->data, 1, pool->extent_bytes, pool->data) == pool->extent_bytes)
-    errorf("cannot read pool: %s", pool->name);
-
-  pool->data_bytes += pool->extent_bytes;
-
-  release(extent->data, pool->size * pool->extent_size);
-  release(extent, sizeof(extent_t));
-
-  pool_extent_create(pool);
-}
-
-byte_t*
-pool_cached (pool_t *pool, off_t position)
-{
-  if (position < pool->extents[0]->offset)
-    return NULL;
-
-  extent_t *extent = NULL;
-
-  for (int i = 0; i < POOL_EXTENTS; i++)
-  {
-    extent = pool->extents[i];
-    if (extent->offset + pool->extent_bytes > position)
-      break;
-  }
-
-  ensure(extent)
-    errorf("attempt to access position beyond pool: %lu", position);
-
-  return extent->data + (position - extent->offset);
-}
-
-void
-pool_open (pool_t *pool, size_t size, size_t extent, char *name)
-{
-  memset(pool, 0, sizeof(pool_t));
-  pool->size = size;
-  pool->extent_size = extent;
-  pool->name = strdup(name);
-
-  pool->extent_count = 0;
-  pool->extent_bytes = size * extent;
-
-  ensure((pool->data = fopen(pool->name, "w")))
-    errorf("cannot create pool: %s", pool->name);
-
-  for (int i = 0; i < POOL_EXTENTS; i++)
-  {
-    pool_extent_create(pool);
-  }
-}
-
-void*
-pool_read (pool_t *pool, off_t position, void *ptr)
-{
-  byte_t *cached = pool_cached(pool, position);
-
-  if (cached)
-  {
-    //memmove(ptr, cached, pool->size);
-    return cached;
-  }
-  else
-  {
-    ensure(fseeko(self->pool_data, position, SEEK_SET) == 0)
-      errorf("cannot seek pool: %s", pool->name);
-
-    ensure(fread(ptr, 1, pool->size, self->pool_data) == pool->size)
-      errorf("cannot read pool: %s", pool->name);
-    return ptr;
-  }
-}
-
-void
-pool_write (pool_t *pool, off_t position, void *ptr)
-{
-  byte_t *cached = pool_cached(pool, position);
-
-  if (cached)
-  {
-    memmove(cached, ptr, pool->size);
-  }
-  else
-  {
-    ensure(fseeko(pool->data, position, SEEK_SET) == 0)
-      errorf("cannot seek pool: %s", pool->name);
-
-    ensure(fwrite(ptr, pool->size, 1, pool->data) == 1)
-      errorf("cannot write pool: %s", pool->name);
-  }
-}
-
-off_t
-pool_alloc (pool_t *pool)
-{
-  for (;;)
-  {
-    for (int i = 0; i < POOL_EXTENTS; i++)
-    {
-      extent_t *extent = pool->extents[i];
-
-      if (extent->first < extent->offset + pool->extent_bytes)
-      {
-        off_t position = extent->first;
-        extent->first += pool->size;
-        return position;
-      }
-    }
-
-    pool_extent_flush(pool);
-    pool_extent_create(pool);
-  }
-}
-
-void
-pool_free (pool_t *pool, off_t position)
-{
-
-}
-
-int
-regmatch (regex_t *re, const char *subject)
-{
-  return regexec(re, subject, 0, NULL, 0) == 0;
-}
-
-typedef int (*ischar)(int);
-
-char*
-strskip (char *str, ischar cb)
-{
-  while (str && *str && cb(*str)) str++;
-  return str;
-}
-
-char*
-strscan (char *str, ischar cb)
-{
-  while (str && *str && !cb(*str)) str++;
-  return str;
-}
-
-char*
-strtrim (char *str, ischar cb)
-{
-  char *left = strskip(str, cb);
-  size_t len = strlen(left);
-  memmove(str, left, len+1);
-  for (
-    char *p = left + len - 1;
-    p >= str && *p && cb(*p);
-    *p = 0, p--
-  );
-  return str;
-}
-
 int
 isalias (int c)
 {
@@ -482,39 +256,30 @@ isalias (int c)
 int
 alias_set (char *str, number_t num)
 {
-  uint32_t hash = 5381;
-  for (int i = 0; str[i]; hash = hash * 33 + str[i++]);
-
   mutex_lock(&alias_mutex);
 
-  alias_t *alias = dict.chains[hash % dict.width];
-
-  for (;
-    alias && strcmp(str, alias->str);
-    alias = alias->next
-  );
+  alias_t *alias = dict_get(dict, str);
 
   int rc = !alias || (alias && alias->num != num) ? 2: 1;
 
   if (!alias)
   {
     size_t len = strlen(str);
-    alias = allocate(sizeof(alias_t));
+    alias = malloc(sizeof(alias_t));
 
     if (!alias) return 0;
 
-    alias->str = allocate(len+1);
+    alias->str = malloc(len+1);
 
     if (!alias->str)
     {
-      release(alias, sizeof(alias));
+      free(alias);
       return 0;
     }
 
     memmove(alias->str, str, len+1);
 
-    alias->next = dict.chains[hash % dict.width];
-    dict.chains[hash % dict.width] = alias;
+    dict_set(dict, alias->str, alias);
   }
 
   alias->num = num;
@@ -526,17 +291,9 @@ alias_set (char *str, number_t num)
 int
 alias_get (char *str, number_t *num)
 {
-  uint32_t hash = 5381;
-  for (int i = 0; str[i]; hash = hash * 33 + str[i++]);
-
   mutex_lock(&alias_mutex);
 
-  alias_t *alias = dict.chains[hash % dict.width];
-
-  for (;
-    alias && strcmp(str, alias->str);
-    alias = alias->next
-  );
+  alias_t *alias = dict_get(dict, str);
 
   int rc = alias ? 1:0;
   *num = alias ? alias->num: 0;
@@ -549,21 +306,13 @@ alias_get (char *str, number_t *num)
 pair_t*
 pair_first (record_t *record, pair_t *pair)
 {
-  if (record->pairs)
-  {
-    return pool_read(&pool_pair, record->pairs, pair);
-  }
-  return NULL;
+  return record->pairs ? pool_read(&pool_pair, record->pairs, pair, self->pool_data): NULL;
 }
 
 pair_t*
 pair_next (pair_t *pair, pair_t *tmp)
 {
-  if (pair && pair->sibling)
-  {
-    return pool_read(&pool_pair, pair->sibling, tmp);
-  }
-  return NULL;
+  return pair && pair->sibling ? pool_read(&pool_pair, pair->sibling, tmp, self->pool_data): NULL;
 }
 
 int
@@ -632,7 +381,7 @@ record_get (number_t id)
 record_t*
 record_set (number_t id)
 {
-  record_t *record = allocate(sizeof(record_t));
+  record_t *record = malloc(sizeof(record_t));
   if (record)
   {
     record->id    = id;
@@ -689,7 +438,7 @@ record_delete(number_t id)
       store.most = NULL;
     }
 
-    release(record, sizeof(record_t));
+    free(record);
     return 1;
   }
   return 0;
@@ -779,7 +528,7 @@ magic_get (char *name, number_t *num)
 int
 parse_number (char **line, number_t *number, char *buffer)
 {
-  char *cursor = strskip(*line, isspace);
+  char *cursor = *line + str_skip(*line, isspace);
 
   if (isdigit(*cursor))
   {
@@ -824,7 +573,7 @@ parse_insert (char *line)
 
   while (*line)
   {
-    line = strskip(line, isspace);
+    line += str_skip(line, isspace);
     if (!*line) break;
 
     if (!parse_number(&line, &key, NULL) || !parse_number(&line, &val, NULL))
@@ -865,7 +614,7 @@ parse_insert (char *line)
 }
 
 void
-fields_release (query_t *query)
+fields_free (query_t *query)
 {
   while (query->fields)
   {
@@ -877,12 +626,12 @@ fields_release (query_t *query)
       field_key_t *fk = field->fkeys;
       field_key_t *fknext = fk->next;
 
-      release(fk, sizeof(field_key_t));
+      free(fk);
 
       field->fkeys = fknext;
     }
 
-    release(field, sizeof(field_t));
+    free(field);
 
     query->fields = next;
   }
@@ -1038,7 +787,7 @@ field_diff_cleanup (query_t *query, field_t *field)
 field_t*
 field_create (query_t *query)
 {
-  field_t *field = allocate(sizeof(field_t));
+  field_t *field = malloc(sizeof(field_t));
   if (!field) return NULL;
 
   memset(field, 0, sizeof(field_t));
@@ -1057,7 +806,7 @@ field_create (query_t *query)
 field_key_t*
 field_key_create (field_t *field)
 {
-  field_key_t *fk = allocate(sizeof(field_key_t));
+  field_key_t *fk = malloc(sizeof(field_key_t));
   if (!fk) return NULL;
 
   memset(fk, 0, sizeof(field_key_t));
@@ -1105,14 +854,14 @@ parse_select (char *line)
   query->handler = respond_row;
   query->filled = 0;
 
-  line = strskip(line, isspace);
+  line += str_skip(line, isspace);
 
   // field list
   while (line && *line)
   {
     if (isspace(*line))
     {
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
       continue;
     }
 
@@ -1253,7 +1002,7 @@ parse_select (char *line)
   {
     if (isspace(*line))
     {
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
       continue;
     }
 
@@ -1296,7 +1045,7 @@ parse_select (char *line)
   {
     if (isspace(*line))
     {
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
       continue;
     }
 
@@ -1466,7 +1215,7 @@ parse_select (char *line)
 
       if (query->all_fields)
       {
-        fields_release(query);
+        fields_free(query);
 
         pair_t _pair;
         for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
@@ -1521,7 +1270,7 @@ val_fail:
   goto done;
 
 done:
-  fields_release(query);
+  fields_free(query);
   rwlock_unlock(&rwlock);
 }
 
@@ -1540,7 +1289,7 @@ parse_delete (char *line)
   {
     if (isspace(*line))
     {
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
       continue;
     }
 
@@ -1571,7 +1320,7 @@ parse_delete (char *line)
   {
     if (isspace(*line))
     {
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
       continue;
     }
 
@@ -1588,7 +1337,7 @@ parse_delete (char *line)
       if (*line && !isspace(*line))
         goto syn_fail;
 
-      line = strskip(line, isspace);
+      line += str_skip(line, isspace);
 
       if (regmatch(&re_limit, line))
       {
@@ -1669,7 +1418,7 @@ num_fail:
   goto done;
 
 done:
-  fields_release(query);
+  fields_free(query);
   rwlock_unlock(&rwlock);
 }
 
@@ -1689,7 +1438,7 @@ parse_alias (char *line)
   if (regmatch(&re_alias_set, line))
   {
     number_t num = strtoll(line, &line, 0);
-    line = strskip(line, isspace);
+    line += str_skip(line, isspace);
 
     int rc = alias_set(line, num);
 
@@ -1724,24 +1473,18 @@ parse_match (char *line)
 
   number_t matches = 0;
 
-  for (size_t i = 0; i < dict.width; i++)
+  dict_each(dict, char*, alias_t*)
   {
-    for (alias_t *alias = dict.chains[i]; alias; alias = alias->next)
-    {
-      if (regmatch(&re, alias->str))
-        matches++;
-    }
+    if (regmatch(&re, loop.key))
+      matches++;
   }
 
   respondf("%u %lu\n", E_OK, matches);
 
-  for (size_t i = 0; i < dict.width; i++)
+  dict_each(dict, char*, alias_t*)
   {
-    for (alias_t *alias = dict.chains[i]; alias; alias = alias->next)
-    {
-      if (regmatch(&re, alias->str))
-        respondf("%lu %s\n", alias->num, alias->str);
-    }
+    if (regmatch(&re, loop.key))
+      respondf("%lu %s\n", loop.value->num, loop.value->str);
   }
 
   regfree(&re);
@@ -1763,14 +1506,7 @@ status ()
     record = record->link, records++
   );
 
-  for (size_t i = 0; i < dict.width; i++)
-  {
-    for (
-      alias_t *alias = dict.chains[i];
-      alias;
-      alias = alias->next, aliases++
-    );
-  }
+  aliases = dict_count(dict);
 
   respondf("records %lu", records);
   respondf(" aliases %lu", aliases);
@@ -1801,28 +1537,6 @@ status ()
   respondf(" record_chains_avg %lu", chains_avg);
   respondf(" record_chains_min %lu", chains_min);
   respondf(" record_chains_max %lu", chains_max);
-
-  chains_avg = 0;
-  chains_min = 0;
-  chains_max = 0;
-
-  for (uint chain = 0; chain < dict.width; chain++)
-  {
-    number_t len = 0;
-    for (alias_t *alias = dict.chains[chain]; alias;
-      alias = alias->next, len++
-    );
-
-    chains_avg += len;
-    if (!chain || len < chains_min) chains_min = len;
-    if (!chain || len > chains_max) chains_max = len;
-  }
-
-  chains_avg /= store.width;
-
-  respondf(" alias_chains_avg %lu", chains_avg);
-  respondf(" alias_chains_min %lu", chains_min);
-  respondf(" alias_chains_max %lu", chains_max);
 
   respondf(" pool_size %lu", pool_pair.size);
   respondf("\n");
@@ -1873,11 +1587,9 @@ consolidate ()
     goto done;
   }
 
-  for (size_t i = 0; aliases && i < dict.width; i++)
-  {
-    for (alias_t *alias = dict.chains[i]; alias; alias = alias->next)
-      fprintf(aliases, "4 %lu %s\n", alias->num, alias->str);
-  }
+  dict_each(dict, char*, alias_t*)
+    fprintf(aliases, "4 %lu %s\n", loop.value->num, loop.value->str);
+
   fclose(aliases);
 
 done:
@@ -1889,7 +1601,7 @@ done:
 void
 parse (char *line)
 {
-  line = strtrim(line, isspace);
+  line = str_trim(line, isspace);
 
   if (!strncmp("1 ", line, 2))
   {
@@ -1957,7 +1669,7 @@ client (void *ptr)
   self_t _self;
   pthread_setspecific(keyself, &_self);
 
-  char *packet = allocate(state.max_packet);
+  char *packet = malloc(state.max_packet);
   self->response = *((int*)ptr);
 
   self->pool_data = fopen(pool_pair.name, "r");
@@ -2000,7 +1712,7 @@ client (void *ptr)
 
 done:
 
-  release(packet, state.max_packet);
+  free(packet);
   close(self->response);
 
   *((int*)ptr) = -1;
@@ -2015,7 +1727,6 @@ main (int argc, char *argv[])
   multithreaded = 0;
 
   store.width = PRIME_10000;
-  dict.width  = PRIME_1000;
 
   state.max_packet  = 1024 * 1024 * 1;
   state.max_threads = 16;
@@ -2032,7 +1743,6 @@ main (int argc, char *argv[])
     if (total_mem > 1024 * 1024 * 1024)
     {
       store.width = PRIME_100000;
-      dict.width  = PRIME_10000;
       pool_pair_extent = 10000000;
     }
   }
@@ -2066,7 +1776,6 @@ main (int argc, char *argv[])
     if (!strcmp("-width", argv[i]))
     {
       store.width = strtoll(argv[++i], NULL, 0);
-      dict.width  = store.width / 10;
       continue;
     }
     if (!strcmp("-threads", argv[i]))
@@ -2076,14 +1785,12 @@ main (int argc, char *argv[])
     }
   }
 
-  store.chains = allocate(sizeof(record_t*) * store.width);
-  dict.chains  = allocate(sizeof(alias_t*)  * dict.width);
+  store.chains = malloc(sizeof(record_t*) * store.width);
 
   for (uint64_t i = 0; i < store.width; i++)
     store.chains[i] = NULL;
 
-  for (uint64_t i = 0; i < dict.width; i++)
-    dict.chains[i] = NULL;
+  dict = dict_create();
 
   ensure(regcomp(&re_range, RE_RANGE, REG_EXTENDED|REG_NOSUB) == 0)
     errorf("regcomp failed: %s", RE_RANGE);
@@ -2109,7 +1816,7 @@ main (int argc, char *argv[])
   ensure(regcomp(&re_limit, RE_ALIAS_GET, REG_EXTENDED|REG_NOSUB) == 0)
     errorf("regcomp failed: %s", RE_LIMIT);
 
-  char *packet = allocate(state.max_packet);
+  char *packet = malloc(state.max_packet);
 
   self->response = 0;
   self->pool_data = fopen(pool_pair.name, "r");
@@ -2145,7 +1852,7 @@ main (int argc, char *argv[])
 
   self->response = fileno(stdout);
 
-  release(packet, state.max_packet);
+  free(packet);
 
   int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
