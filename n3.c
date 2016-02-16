@@ -464,6 +464,19 @@ record_get_within (number_t id, number_t limit)
 }
 
 int
+tryread (int fd, void *buffer, size_t length)
+{
+  size_t bytes = 0;
+  for (int i = 0; i < 3 && bytes < length; i++)
+  {
+    int written = read(fd, buffer + bytes, length - bytes);
+    if (written < 1) break;
+    bytes += written;
+  }
+  return bytes == length;
+}
+
+int
 trywrite (int fd, void *buffer, size_t length)
 {
   size_t bytes = 0;
@@ -1697,7 +1710,7 @@ client (void *ptr)
     char *cursor = packet;
 
     for (;
-      read(self->response, cursor, 1) == 1 && *cursor && *cursor != '\n' && cursor < &packet[state.max_packet-1];
+      tryread(self->response, cursor, 1) == 1 && *cursor && *cursor != '\n' && cursor < &packet[state.max_packet-1];
       cursor++
     );
 
