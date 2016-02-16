@@ -1,3 +1,3 @@
 [submodule "toolbelt"]
 	path = toolbelt
-	url = git@github.com:seanpringle/toolbelt.git
+	url = https://github.com/seanpringle/toolbelt.git
