@@ -596,51 +596,50 @@ parse_insert (char *line)
     return;
   }
 
+  int strict = 1;
+
+  rwlock_wrlock(&rwlock);
+  record_t *record = record_get(id);
+
+  if (!record)
+  {
+    record = record_set(id);
+    strict = 0;
+  }
   while (*line)
   {
     line += str_skip(line, isspace);
     if (!*line) break;
 
     if (!parse_number(&line, &key, NULL) || !parse_number(&line, &val, NULL))
+      goto err_pair;
+
+    int rc = pair_insert(record, key, val, strict);
+
+    if (rc == 1)
     {
-      respondf("%u expected key and val (%lu): %s\n", E_PARSE, id, line);
-      return;
+      activityf("%u %lu %lu %lu", O_INSERT, id, key, val);
+      continue;
     }
-
-    int strict = 1;
-
-    rwlock_wrlock(&rwlock);
-    record_t *record = record_get(id);
-
-    if (!record)
-    {
-      record = record_set(id);
-      strict = 0;
-    }
-
-    if (record)
-    {
-      int rc = pair_insert(record, key, val, strict);
-      if (rc)
-      {
-        if (rc == 1)
-          activityf("%u %lu %lu %lu", O_INSERT, id, key, val);
-
-        rwlock_unlock(&rwlock);
-        continue;
-      }
-      if (!record->pairs)
-      {
-        record_delete(id);
-      }
-    }
-
-    rwlock_unlock(&rwlock);
-    respondf("%u %s %d\n", E_SERVER, __func__, __LINE__);
-    return;
+    goto err_sys;
   }
 
+  if (!record->pairs)
+    record_delete(id);
+
+  rwlock_unlock(&rwlock);
   respondf("%u\n", E_OK);
+  return;
+
+err_pair:
+  rwlock_unlock(&rwlock);
+  respondf("%u expected key and val (%lu): %s\n", E_PARSE, id, line);
+  return;
+
+err_sys:
+  rwlock_unlock(&rwlock);
+  respondf("%u %s %d\n", E_SERVER, __func__, __LINE__);
+  return;
 }
 
 void
