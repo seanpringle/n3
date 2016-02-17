@@ -1428,11 +1428,11 @@ parse_delete (char *line)
   goto done;
 
 syn_fail:
-  respondf("%u unexpected syntax\n", E_PARSE, line);
+  respondf("%u unexpected syntax: %s\n", E_PARSE, line);
   goto done;
 
 res_fail:
-  respondf("%u insufficient resources\n", E_SERVER, line);
+  respondf("%u insufficient resources\n", E_SERVER);
   goto done;
 
 id_fail:
