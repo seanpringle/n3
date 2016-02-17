@@ -354,7 +354,7 @@ pair_delete (record_t *record, number_t key)
 
   while (pair && pair->key != key)
   {
-    memmove(&pair2, &pair1, sizeof(pair_t));
+    memmove(&pair2, pair, sizeof(pair_t));
     pair = pair_next(pair, &pair1);
   }
   if (pair)
