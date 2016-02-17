@@ -616,11 +616,13 @@ parse_insert (char *line)
 
     int rc = pair_insert(record, key, val, strict);
 
-    if (rc == 1)
+    if (rc)
     {
-      activityf("%u %lu %lu %lu", O_INSERT, id, key, val);
+      if (rc == 1)
+        activityf("%u %lu %lu %lu", O_INSERT, id, key, val);
       continue;
     }
+
     goto err_sys;
   }
 
