@@ -359,8 +359,11 @@ pair_delete (record_t *record, number_t key)
   }
   if (pair)
   {
-    pair2.sibling = pair->sibling;
-    pool_write(&pool_pair, pair2.offset, &pair2);
+    if (pair2.sibling)
+    {
+      pair2.sibling = pair->sibling;
+      pool_write(&pool_pair, pair2.offset, &pair2);
+    }
     pool_free(&pool_pair, pair->offset);
     return 1;
   }
