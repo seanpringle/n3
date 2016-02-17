@@ -316,21 +316,26 @@ pair_next (pair_t *pair, pair_t *tmp)
 }
 
 int
-pair_insert (record_t *record, number_t key, number_t val)
+pair_insert (record_t *record, number_t key, number_t val, int strict)
 {
-  pair_t _pair, *pair = pair_first(record, &_pair);
+  pair_t _pair, *pair = NULL;
 
-  while (pair && pair->key != key)
-    pair = pair_next(pair, &_pair);
-
-  if (pair && pair->val == val)
-    return 2;
-
-  if (pair)
+  if (strict)
   {
-    pair->val = val;
-    pool_write(&pool_pair, pair->offset, pair);
-    return 1;
+    pair = pair_first(record, &_pair);
+
+    while (pair && pair->key != key)
+      pair = pair_next(pair, &_pair);
+
+    if (pair && pair->val == val)
+      return 2;
+
+    if (pair)
+    {
+      pair->val = val;
+      pool_write(&pool_pair, pair->offset, pair);
+      return 1;
+    }
   }
 
   pair = &_pair;
@@ -602,15 +607,20 @@ parse_insert (char *line)
       return;
     }
 
+    int strict = 1;
+
     rwlock_wrlock(&rwlock);
     record_t *record = record_get(id);
 
     if (!record)
+    {
       record = record_set(id);
+      strict = 0;
+    }
 
     if (record)
     {
-      int rc = pair_insert(record, key, val);
+      int rc = pair_insert(record, key, val, strict);
       if (rc)
       {
         if (rc == 1)
