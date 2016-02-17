@@ -359,7 +359,7 @@ pair_delete (record_t *record, number_t key)
   }
   if (pair)
   {
-    if (record->pairs != pair.offset)
+    if (record->pairs != pair->offset)
     {
       pair2.sibling = pair->sibling;
       pool_write(&pool_pair, pair2.offset, &pair2);
