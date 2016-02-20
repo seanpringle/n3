@@ -1504,18 +1504,18 @@ parse_match (char *line)
 
   number_t matches = 0;
 
-  dict_each(dict, char*, alias_t*)
+  dict_each_key(dict, char *key)
   {
-    if (regmatch(&re, loop.key))
+    if (regmatch(&re, key))
       matches++;
   }
 
   respondf("%u %lu\n", E_OK, matches);
 
-  dict_each(dict, char*, alias_t*)
+  dict_each(dict, char *key, alias_t *alias)
   {
-    if (regmatch(&re, loop.key))
-      respondf("%lu %s\n", loop.value->num, loop.value->str);
+    if (regmatch(&re, key))
+      respondf("%lu %s\n", alias->num, alias->str);
   }
 
   regfree(&re);
@@ -1622,8 +1622,8 @@ consolidate ()
     goto done;
   }
 
-  dict_each(dict, char*, alias_t*)
-    fprintf(aliases, "4 %lu %s\n", loop.value->num, loop.value->str);
+  dict_each_val(dict, alias_t *alias)
+    fprintf(aliases, "4 %lu %s\n", alias->num, alias->str);
 
   fclose(aliases);
 
