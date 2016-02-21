@@ -70,7 +70,6 @@ errortime ()
 #define LINE 1024
 #define PATH 256
 #define ALIAS 128
-#define POOL_EXTENTS 3
 
 #define E_OK 0
 #define E_PARSE 1
@@ -92,9 +91,15 @@ typedef struct _pair_t {
   number_t val;
 } pair_t;
 
+typedef struct _record_persist_t {
+  number_t id;
+  off_t pairs;
+} record_persist_t;
+
 typedef struct _record_t {
   number_t id;
   off_t pairs;
+  off_t persist;
   struct _record_t *next, *link;
 } record_t;
 
@@ -119,7 +124,6 @@ typedef struct {
 
 typedef struct _self_t {
   int response;
-  FILE *pool_data;
 } self_t;
 
 struct _field_t;
@@ -215,6 +219,7 @@ rwlock_unlock (pthread_rwlock_t *rwlock)
     pthread_rwlock_unlock(rwlock);
 }
 
+pool_t pool_record;
 pool_t pool_pair;
 
 #define RE_NAME "[[:alpha:]][[:digit:][:alpha:]_.@-]*"
@@ -306,14 +311,16 @@ alias_get (char *str, number_t *num)
 pair_t*
 pair_first (record_t *record, pair_t *pair)
 {
-  return record->pairs ? pool_read(&pool_pair, record->pairs, pair, self->pool_data): NULL;
+  return record->pairs ? pool_read(&pool_pair, record->pairs, pair): NULL;
 }
 
 pair_t*
 pair_next (pair_t *pair, pair_t *tmp)
 {
-  return pair && pair->sibling ? pool_read(&pool_pair, pair->sibling, tmp, self->pool_data): NULL;
+  return pair && pair->sibling ? pool_read(&pool_pair, pair->sibling, tmp): NULL;
 }
+
+void record_persist (record_t *record);
 
 int
 pair_insert (record_t *record, number_t key, number_t val, int strict)
@@ -347,6 +354,7 @@ pair_insert (record_t *record, number_t key, number_t val, int strict)
   record->pairs = pair->offset;
 
   pool_write(&pool_pair, pair->offset, pair);
+  record_persist(record);
 
   return 1;
 }
@@ -372,6 +380,7 @@ pair_delete (record_t *record, number_t key)
     else
     {
       record->pairs = pair->sibling;
+      record_persist(record);
     }
     pool_free(&pool_pair, pair->offset);
     return 1;
@@ -390,10 +399,19 @@ record_get (number_t id)
   return record;
 }
 
+void
+record_persist (record_t *record)
+{
+  record_t *persist = pool_read(&pool_record, record->persist, NULL);
+  persist->id = record->id;
+  persist->pairs = record->pairs;
+}
+
 record_t*
-record_set (number_t id)
+record_set (number_t id, off_t persist)
 {
   record_t *record = malloc(sizeof(record_t));
+
   if (record)
   {
     record->id    = id;
@@ -401,6 +419,7 @@ record_set (number_t id)
     record->next  = store.chains[id % store.width];
     record->link  = NULL;
     store.chains[id % store.width] = record;
+    record->persist = persist ? persist: pool_alloc(&pool_record);
 
     if (store.most && record->id > store.most->id)
     {
@@ -420,6 +439,8 @@ record_set (number_t id)
     {
       store.most = record;
     }
+
+    record_persist(record);
   }
   return record;
 }
@@ -450,6 +471,7 @@ record_delete(number_t id)
       store.most = NULL;
     }
 
+    pool_free(&pool_record, record->persist);
     free(record);
     return 1;
   }
@@ -603,7 +625,7 @@ parse_insert (char *line)
 
   if (!record)
   {
-    record = record_set(id);
+    record = record_set(id, 0);
     strict = 0;
   }
   while (*line)
@@ -629,6 +651,8 @@ parse_insert (char *line)
   if (!record->pairs)
     record_delete(id);
 
+  pool_sync(&pool_record);
+  pool_sync(&pool_pair);
   rwlock_unlock(&rwlock);
   respondf("%u\n", E_OK);
   return;
@@ -1425,6 +1449,8 @@ parse_delete (char *line)
     goto id_fail;
   }
 
+  pool_sync(&pool_record);
+  pool_sync(&pool_pair);
   respondf("%u %lu %lu\n", E_OK, deleted_records, deleted_pairs);
   goto done;
 
@@ -1568,12 +1594,6 @@ show_status ()
   respondf(" record_chains_avg %lu", chains_avg);
   respondf(" record_chains_min %lu", chains_min);
   respondf(" record_chains_max %lu", chains_max);
-
-  respondf(" pool_size %lu", pool_pair.size);
-  respondf(" pool_data_bytes %lu", pool_pair.data_bytes);
-  respondf(" pool_extent_size %lu", pool_pair.extent_size);
-  respondf(" pool_extent_count %lu", pool_pair.extent_count);
-  respondf(" pool_extent_bytes %lu", pool_pair.extent_bytes);
   respondf("\n");
 }
 
@@ -1707,17 +1727,9 @@ client (void *ptr)
   char *packet = malloc(state.max_packet);
   self->response = *((int*)ptr);
 
-  self->pool_data = fopen(pool_pair.name, "r");
-
   if (!packet)
   {
     respondf("%u oom\n", E_SERVER);
-    goto done;
-  }
-
-  if (!self->pool_data)
-  {
-    respondf("%u i/o\n", E_SERVER);
     goto done;
   }
 
@@ -1743,8 +1755,6 @@ client (void *ptr)
     break;
   }
 
-  fclose(self->pool_data);
-
 done:
 
   free(packet);
@@ -1760,6 +1770,7 @@ main (int argc, char *argv[])
 {
   char scratch[PATH];
   multithreaded = 0;
+  int replay = 0;
 
   store.width = PRIME_10000;
 
@@ -1769,17 +1780,12 @@ main (int argc, char *argv[])
   long page_size  = sysconf(_SC_PAGESIZE);
   long phys_pages = sysconf(_SC_PHYS_PAGES);
 
-  size_t pool_pair_extent = 1000000;
-
   if (page_size > 0 && phys_pages > 0)
   {
     number_t total_mem = (number_t)phys_pages * (number_t)page_size;
 
     if (total_mem > 1024 * 1024 * 1024)
-    {
       store.width = PRIME_100000;
-      pool_pair_extent = 10000000;
-    }
   }
 
   snprintf(state.sock_path, sizeof(state.sock_path), "/tmp/n3.sock");
@@ -1793,8 +1799,6 @@ main (int argc, char *argv[])
   self_t _self;
   pthread_setspecific(keyself, &_self);
   signal(SIGPIPE, SIG_IGN);
-
-  pool_open(&pool_pair, sizeof(pair_t), pool_pair_extent, "pool");
 
   for (int i = 1; i < argc; i++)
   {
@@ -1813,12 +1817,25 @@ main (int argc, char *argv[])
       store.width = strtoll(argv[++i], NULL, 0);
       continue;
     }
+    if (!strcmp("-replay", argv[i]))
+    {
+      replay = 1;
+      continue;
+    }
     if (!strcmp("-threads", argv[i]))
     {
       state.max_threads = strtoll(argv[++i], NULL, 0);
       continue;
     }
   }
+
+  snprintf(scratch, PATH, "%s/records", state.data_path);
+  if (replay) unlink(scratch);
+  pool_open(&pool_record, scratch, sizeof(record_persist_t), 1000000);
+
+  snprintf(scratch, PATH, "%s/pairs", state.data_path);
+  if (replay) unlink(scratch);
+  pool_open(&pool_pair, scratch, sizeof(pair_t), 1000000);
 
   store.chains = malloc(sizeof(record_t*) * store.width);
 
@@ -1854,18 +1871,31 @@ main (int argc, char *argv[])
   char *packet = malloc(state.max_packet);
 
   self->response = 0;
-  self->pool_data = fopen(pool_pair.name, "r");
   activity = NULL;
-
-  snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
-  FILE *replay = fopen(scratch, "r");
 
   if (replay)
   {
+    snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
+    FILE *freplay = fopen(scratch, "r");
+
+    ensure(freplay)
+      errorf("unable to replay");
+
     errorf("replay %s", scratch);
-    while (fgets(packet, state.max_packet, replay))
+    while (fgets(packet, state.max_packet, freplay))
       parse(packet);
-    fclose(replay);
+    fclose(freplay);
+  }
+  else
+  {
+    snprintf(scratch, sizeof(scratch), "%s/records", state.data_path);
+    errorf("reload %s", scratch);
+
+    pool_each(&pool_record, record_persist_t *persist)
+    {
+      record_t *record = record_set(persist->id, loop.pos);
+      record->pairs = persist->pairs;
+    }
   }
 
   snprintf(scratch, sizeof(scratch), "%s/activity", state.data_path);
