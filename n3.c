@@ -440,7 +440,8 @@ record_set (number_t id, off_t persist)
       store.most = record;
     }
 
-    record_persist(record);
+    if (!persist)
+      record_persist(record);
   }
   return record;
 }
