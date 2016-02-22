@@ -1167,8 +1167,7 @@ parse_select (char *line)
         {
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
-            pair_t _pair;
-            for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
+            for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
             {
               if (pair->key == fk->key)
               {
@@ -1228,8 +1227,7 @@ parse_select (char *line)
       {
         for (field_t *field = query->fields; field; field = field->next)
         {
-          pair_t _pair;
-          for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
+          for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
           {
             for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
             {
@@ -1273,8 +1271,7 @@ parse_select (char *line)
       {
         fields_free(query);
 
-        pair_t _pair;
-        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
+        for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
         {
           field_t *field  = field_create(query);
           if (!field) goto res_fail;
@@ -1290,8 +1287,7 @@ parse_select (char *line)
       {
         field->prepare(query, field);
 
-        pair_t _pair;
-        for (pair_t *pair = pair_first(record, &_pair); pair; pair = pair_next(pair, &_pair))
+        for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
         {
           for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
           {
