@@ -181,7 +181,7 @@ static pthread_key_t keyself;
 FILE *activity;
 store_t store;
 state_t state;
-dict_t *dict;
+map_t *map;
 int multithreaded;
 
 void
@@ -263,7 +263,7 @@ alias_set (char *str, number_t num)
 {
   mutex_lock(&alias_mutex);
 
-  alias_t *alias = dict_get(dict, str);
+  alias_t *alias = map_get(map, str);
 
   int rc = !alias || (alias && alias->num != num) ? 2: 1;
 
@@ -284,7 +284,7 @@ alias_set (char *str, number_t num)
 
     memmove(alias->str, str, len+1);
 
-    dict_set(dict, alias->str, alias);
+    map_set(map, alias->str, alias);
   }
 
   alias->num = num;
@@ -298,7 +298,7 @@ alias_get (char *str, number_t *num)
 {
   mutex_lock(&alias_mutex);
 
-  alias_t *alias = dict_get(dict, str);
+  alias_t *alias = map_get(map, str);
 
   int rc = alias ? 1:0;
   *num = alias ? alias->num: 0;
@@ -1527,7 +1527,7 @@ parse_match (char *line)
 
   number_t matches = 0;
 
-  dict_each_key(dict, char *key)
+  map_each_key(map, char *key)
   {
     if (regmatch(&re, key))
       matches++;
@@ -1535,7 +1535,7 @@ parse_match (char *line)
 
   respondf("%u %lu\n", E_OK, matches);
 
-  dict_each(dict, char *key, alias_t *alias)
+  map_each(map, char *key, alias_t *alias)
   {
     if (regmatch(&re, key))
       respondf("%lu %s\n", alias->num, alias->str);
@@ -1560,7 +1560,7 @@ show_status ()
     record = record->link, records++
   );
 
-  aliases = dict_count(dict);
+  aliases = map_count(map);
 
   respondf("records %lu", records);
   respondf(" aliases %lu", aliases);
@@ -1639,7 +1639,7 @@ consolidate ()
     goto done;
   }
 
-  dict_each_val(dict, alias_t *alias)
+  map_each_val(map, alias_t *alias)
     fprintf(aliases, "4 %lu %s\n", alias->num, alias->str);
 
   fclose(aliases);
@@ -1839,7 +1839,7 @@ main (int argc, char *argv[])
   for (uint64_t i = 0; i < store.width; i++)
     store.chains[i] = NULL;
 
-  dict = dict_create();
+  map = map_create();
 
   ensure(regcomp(&re_range, RE_RANGE, REG_EXTENDED|REG_NOSUB) == 0)
     errorf("regcomp failed: %s", RE_RANGE);
