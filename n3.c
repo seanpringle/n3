@@ -1165,9 +1165,9 @@ parse_select (char *line)
       {
         for (field_t *field = query->fields; field; field = field->next)
         {
-          for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
+          for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
           {
-            for (pair_t *pair = pair_first(record, NULL); pair; pair = pair_next(pair, NULL))
+            for (field_key_t *fk = field->fkeys; fk; fk = fk->next)
             {
               if (pair->key == fk->key)
               {
